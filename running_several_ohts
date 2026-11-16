@@ -1,0 +1,470 @@
+import math
+import builtins
+
+# ---------------------------------------------------------------------------
+# SETTINGS
+# ---------------------------------------------------------------------------
+TEMPLATE_PATH = "/World/OHT2grip_Revised"   # OHT model to copy
+FLEET_PATH    = "/World/OHT_Fleet"
+NUM_OHT       = 4            # 3+ vehicles; capacity check is done on start
+HIDE_TEMPLATE = False
+
+# Closed loop, in travel order (world X, Y in metres). These corner points
+# are taken from the rails in your file: the bay with three lanes at
+# Y = -20.241 / -22.041 / -24.141 between X = 7.698 and 29.398.
+# Route: bottom lane eastbound -> right rail north -> top lane westbound
+#        -> left rail south.  The Magazine_Drop_Target is on the bottom lane.
+ROUTE_XY = [
+    (8.498, -24.141),
+    (28.598, -24.141),
+    (29.398, -23.341),
+    (29.398, -21.041),
+    (28.598, -20.241),
+    (8.498, -20.241),
+    (7.698, -21.041),
+    (7.698, -23.341),
+]
+# Optional: use a BasisCurves/Points prim you drew instead of ROUTE_XY
+# (its points are read in order as a closed loop). Leave None to use ROUTE_XY.
+ROUTE_PRIM = None
+CORNER_RADIUS_M = 0.6        # rounding of route corners
+REVERSE_DIRECTION = False
+
+# Motion (metres, seconds)
+V_MAX        = 1.5           # cruise speed
+V_CURVE_LAT_ACC = 0.5        # lateral accel limit -> slower in curves
+A_MAX        = 0.6           # acceleration
+B_COMFORT    = 0.8           # normal braking
+B_EMERGENCY  = 3.0           # emergency braking
+TIME_HEADWAY = 1.2           # follower keeps ~this many seconds behind
+MIN_GAP_M    = 0.4           # bumper-to-bumper standstill gap
+VEHICLE_LENGTH_M = None      # None = measure from the model (fallback 1.2)
+
+# Stations (move & grab). Each OHT stops at a station on every
+# STOP_EVERY_N-th pass (staggered per vehicle so you see queueing).
+STATIONS = [
+    {"name": "DropTarget", "xy": (9.18, -24.141)},
+    {"name": "TopLane",    "xy": (19.0, -20.241)},
+]
+STOP_EVERY_N  = 2
+HOIST_DROP_M  = None         # None = to Magazine_Drop_Target height (fallback 2.5)
+HOIST_TIME_S  = 2.0          # lowering time (same for raising)
+GRIP_TIME_S   = 1.0
+
+YAW_OFFSET_DEG = 0.0         # set to 180 if the models drive backwards
+RUN_ONLY_WHEN_PLAYING = False   # True = move only while the timeline is playing
+OHT_Z_OFFSET_M = 0.0         # raise(+)/lower(-) all OHTs. If they sit ON TOP of
+                             # the rail instead of hanging under it, try -0.3
+SHOW_ROUTE    = True
+
+
+# ---------------------------------------------------------------------------
+# Route geometry (pure python, no USD needed)
+# ---------------------------------------------------------------------------
+class LoopPath:
+    def __init__(self, corners, radius, step=0.05):
+        pts = self._round_corners(corners, radius)
+        pts.append(pts[0])
+        # dense resample
+        self.xy = []
+        for (x0, y0), (x1, y1) in zip(pts[:-1], pts[1:]):
+            seg = math.hypot(x1 - x0, y1 - y0)
+            n = max(1, int(math.ceil(seg / step)))
+            for k in range(n):
+                t = k / n
+                self.xy.append((x0 + (x1 - x0) * t, y0 + (y1 - y0) * t))
+        self.s = [0.0]
+        for i in range(1, len(self.xy) + 1):
+            a, b = self.xy[i - 1], self.xy[i % len(self.xy)]
+            self.s.append(self.s[-1] + math.hypot(b[0] - a[0], b[1] - a[1]))
+        self.length = self.s[-1]
+        self.n = len(self.xy)
+        self.ds = self.length / self.n
+        # heading and curvature-based speed limit per sample
+        self.yaw = []
+        for i in range(self.n):
+            a, b = self.xy[i - 1], self.xy[(i + 1) % self.n]
+            self.yaw.append(math.atan2(b[1] - a[1], b[0] - a[0]))
+        self.vlim = []
+        w = max(1, int(0.3 / self.ds))
+        for i in range(self.n):
+            d = self.yaw[(i + w) % self.n] - self.yaw[i - w]
+            d = (d + math.pi) % (2 * math.pi) - math.pi
+            k = abs(d) / (2 * w * self.ds)
+            self.vlim.append(V_MAX if k < 1e-3 else min(V_MAX, math.sqrt(V_CURVE_LAT_ACC / k)))
+
+    @staticmethod
+    def _round_corners(c, r):
+        out, n = [], len(c)
+        for i in range(n):
+            p0, p1, p2 = c[i - 1], c[i], c[(i + 1) % n]
+            v1 = (p1[0] - p0[0], p1[1] - p0[1]); l1 = math.hypot(*v1)
+            v2 = (p2[0] - p1[0], p2[1] - p1[1]); l2 = math.hypot(*v2)
+            if l1 < 1e-6 or l2 < 1e-6:
+                continue
+            u1 = (v1[0] / l1, v1[1] / l1); u2 = (v2[0] / l2, v2[1] / l2)
+            cosang = max(-1.0, min(1.0, u1[0] * u2[0] + u1[1] * u2[1]))
+            theta = math.acos(cosang)
+            if theta < math.radians(3):
+                out.append(p1); continue
+            t = min(r * math.tan(theta / 2), 0.45 * l1, 0.45 * l2)
+            a = (p1[0] - u1[0] * t, p1[1] - u1[1] * t)
+            b = (p1[0] + u2[0] * t, p1[1] + u2[1] * t)
+            for k in range(9):          # quadratic bezier a -> p1 -> b
+                q = k / 8
+                out.append(((1-q)**2*a[0] + 2*(1-q)*q*p1[0] + q*q*b[0],
+                            (1-q)**2*a[1] + 2*(1-q)*q*p1[1] + q*q*b[1]))
+        return out
+
+    def wrap(self, s):
+        return s % self.length
+
+    def index(self, s):
+        return int(self.wrap(s) / self.ds) % self.n
+
+    def pose(self, s):
+        s = self.wrap(s)
+        i = min(self.n - 1, int(s / self.ds))
+        j = (i + 1) % self.n
+        f = (s - i * self.ds) / self.ds
+        x = self.xy[i][0] + (self.xy[j][0] - self.xy[i][0]) * f
+        y = self.xy[i][1] + (self.xy[j][1] - self.xy[i][1]) * f
+        return x, y, self.yaw[i]
+
+    def project(self, xy):
+        best, bi = 1e18, 0
+        for i, p in enumerate(self.xy):
+            d = (p[0] - xy[0]) ** 2 + (p[1] - xy[1]) ** 2
+            if d < best:
+                best, bi = d, i
+        return bi * self.ds, math.sqrt(best)
+
+    def ahead(self, s_from, s_to):
+        """forward distance along the loop from s_from to s_to"""
+        return (s_to - s_from) % self.length
+
+
+# ---------------------------------------------------------------------------
+# Traffic logic (pure python)
+# ---------------------------------------------------------------------------
+class Vehicle:
+    def __init__(self, idx, s):
+        self.idx = idx
+        self.s = s
+        self.v = 0.0
+        self.state = "drive"      # drive | lower | grip | raise
+        self.timer = 0.0
+        self.hoist = 0.0          # 0 = up, 1 = fully lowered
+        self.passes = {}         # station index -> times reached
+        self.target = None        # (station index, s) / ("pass", k, s) / None
+        self.target_dist = 0.0
+        self.leaving = None       # station index just served
+
+
+class FleetSim:
+    def __init__(self, path, n, veh_len, stations_s):
+        self.path, self.L = path, veh_len
+        self.stations_s = stations_s
+        need = n * (veh_len + MIN_GAP_M + 0.5)
+        if need > path.length:
+            raise ValueError("Loop is %.1f m but %d OHTs need %.1f m. Use fewer OHTs or a longer loop."
+                             % (path.length, n, need))
+        spacing = path.length / n
+        self.veh = [Vehicle(i, i * spacing) for i in range(n)]
+        self.min_gap_seen = 1e9
+        for v in self.veh:
+            self._next_target(v)
+
+    def gap_to_leader(self, v):
+        best = None
+        for o in self.veh:
+            if o is v:
+                continue
+            d = self.path.ahead(v.s, o.s)
+            if best is None or d < best[0]:
+                best = (d, o)
+        return best[0] - self.L, best[1]
+
+    def _next_target(self, v):
+        # nearest station ahead that this vehicle should stop at on this pass
+        best = None
+        for k, ss in enumerate(self.stations_s):
+            d = self.path.ahead(v.s, ss)
+            if d < 0.05:          # the station we are at / just left -> next lap
+                d += self.path.length
+            if best is None or d < best[0]:
+                best = (d, k, ss)
+        v.target = None
+        if best:
+            d, k, ss = best
+            v.target_dist = d     # remaining distance, counted down while driving
+            v.passes[k] = v.passes.get(k, 0) + 1
+            if (v.passes[k] + v.idx + k) % STOP_EVERY_N == 0:
+                v.target = (k, ss)
+            else:
+                v.target = ("pass", k, ss)
+
+    def step(self, dt):
+        dt = min(dt, 0.05)
+        old_s = {v.idx: v.s for v in self.veh}
+        for v in self.veh:
+            gap, lead = self.gap_to_leader(v)
+            if v.state != "drive":
+                self._station_work(v, dt)
+                continue
+            # 1) leader: braking curve + time headway
+            free = gap - MIN_GAP_M
+            if free <= 0:
+                v_lead_lim = 0.0
+            else:
+                v_lead_lim = min(math.sqrt(lead.v ** 2 + 2 * B_COMFORT * free),
+                                 free / TIME_HEADWAY + lead.v * 0.5)
+            # 2) curves ahead
+            v_curve = V_MAX
+            look = V_MAX ** 2 / (2 * B_COMFORT) + 0.5
+            d = 0.0
+            while d <= look:
+                vl = self.path.vlim[self.path.index(v.s + d)]
+                v_curve = min(v_curve, math.sqrt(vl ** 2 + 2 * B_COMFORT * d))
+                d += 0.1
+            # 3) station stop
+            v_stn = V_MAX
+            if v.target and v.target[0] != "pass":
+                ds = max(0.0, v.target_dist)
+                v_stn = math.sqrt(2 * B_COMFORT * ds) if ds > 0.02 else 0.0
+                if ds <= 0.02 and v.v < 0.05:
+                    v.s, v.v, v.state, v.timer = v.target[1], 0.0, "lower", 0.0
+                    continue
+            v_target = min(V_MAX, v_lead_lim, v_curve, v_stn)
+            if v_target >= v.v:
+                v.v = min(v_target, v.v + A_MAX * dt)
+            else:
+                brake = B_COMFORT if v.v - v_target <= B_COMFORT * dt * 4 else B_EMERGENCY
+                v.v = max(v_target, v.v - brake * dt)
+            # hard safety clamp against the leader's previous position
+            max_move = self.path.ahead(v.s, old_s[lead.idx]) - self.L - MIN_GAP_M
+            move = min(v.v * dt, max(0.0, max_move))
+            if move < v.v * dt:
+                v.v = move / dt
+            v.s = self.path.wrap(v.s + move)
+            if v.target:
+                v.target_dist -= move
+                # passed a pass-through station?
+                if v.target[0] == "pass" and v.target_dist <= 0:
+                    v.leaving = v.target[1]
+                    self._next_target(v)
+        # bookkeeping: smallest bumper gap observed
+        for v in self.veh:
+            g, _ = self.gap_to_leader(v)
+            self.min_gap_seen = min(self.min_gap_seen, g)
+
+    def _station_work(self, v, dt):
+        v.timer += dt
+        if v.state == "lower":
+            v.hoist = min(1.0, v.timer / HOIST_TIME_S)
+            if v.timer >= HOIST_TIME_S:
+                v.state, v.timer = "grip", 0.0
+        elif v.state == "grip":
+            if v.timer >= GRIP_TIME_S:
+                v.state, v.timer = "raise", 0.0
+        elif v.state == "raise":
+            v.hoist = max(0.0, 1.0 - v.timer / HOIST_TIME_S)
+            if v.timer >= HOIST_TIME_S:
+                v.state, v.hoist = "drive", 0.0
+                v.leaving = v.target[0]
+                self._next_target(v)
+
+
+# ---------------------------------------------------------------------------
+# Omniverse glue
+# ---------------------------------------------------------------------------
+def _run_in_omniverse():
+    import omni.usd
+    import omni.kit.app
+    import omni.timeline
+    from pxr import Usd, UsdGeom, UsdPhysics, Sdf, Gf, Vt
+
+    old = getattr(builtins, "_oht_fleet", None)
+    if old is not None:
+        old.stop()
+
+    stage = omni.usd.get_context().get_stage()
+    tmpl = stage.GetPrimAtPath(TEMPLATE_PATH)
+    if not tmpl.IsValid():
+        raise RuntimeError("Template prim not found: " + TEMPLATE_PATH)
+
+    # ---- route
+    if ROUTE_PRIM:
+        pts = stage.GetPrimAtPath(ROUTE_PRIM).GetAttribute("points").Get()
+        corners = [(float(p[0]), float(p[1])) for p in pts]
+    else:
+        corners = list(ROUTE_XY)
+    if REVERSE_DIRECTION:
+        corners.reverse()
+    path = LoopPath(corners, CORNER_RADIUS_M)
+
+    # ---- template info
+    t_attr = tmpl.GetAttribute("xformOp:translate:oht")
+    oht_z = float(t_attr.Get()[2]) if t_attr and t_attr.Get() is not None else -0.199
+    oht_z += OHT_Z_OFFSET_M
+    base = tmpl.GetCustomDataByKey("ohtFollowerBaseOrient")
+    base_q = Gf.Quatd(base[0], base[1], base[2], base[3]) if base is not None else Gf.Quatd(1, 0, 0, 0)
+
+    veh_len = VEHICLE_LENGTH_M
+    if veh_len is None:
+        veh_len = 1.2
+        try:
+            cache = UsdGeom.BBoxCache(Usd.TimeCode.Default(), [UsdGeom.Tokens.default_, UsdGeom.Tokens.render])
+            rng = cache.ComputeWorldBound(tmpl).ComputeAlignedRange()
+            if not rng.IsEmpty():
+                size = rng.GetSize()
+                veh_len = max(0.6, min(2.0, max(size[0], size[1])))
+        except Exception:
+            pass
+
+    drop_m = HOIST_DROP_M
+    if drop_m is None:
+        drop_m = 2.5
+        tgt = stage.GetPrimAtPath("/World/Magazine_Drop_Target")
+        hu = stage.GetPrimAtPath(TEMPLATE_PATH + "/Hoist_Unit")
+        if tgt.IsValid() and hu.IsValid():
+            tz = UsdGeom.Xformable(tgt).ComputeLocalToWorldTransform(0).ExtractTranslation()[2]
+            hz = UsdGeom.Xformable(hu).ComputeLocalToWorldTransform(0).ExtractTranslation()[2]
+            if 0.2 < hz - tz < 10:
+                drop_m = hz - tz
+
+    # ---- fleet prims
+    fleet = UsdGeom.Xform.Define(stage, FLEET_PATH).GetPrim()
+    for child in list(fleet.GetChildren()):
+        stage.RemovePrim(child.GetPath())
+
+    src_layer = None
+    for layer in stage.GetLayerStack():
+        if layer.GetPrimAtPath(TEMPLATE_PATH):
+            src_layer = layer
+            break
+    dst_layer = stage.GetEditTarget().GetLayer()
+
+    prims = []
+    for i in range(NUM_OHT):
+        p = "%s/OHT_%02d" % (FLEET_PATH, i + 1)
+        Sdf.CopySpec(src_layer, TEMPLATE_PATH, dst_layer, p)
+        prim = stage.GetPrimAtPath(p)
+        prim.ClearCustomDataByKey("ohtFollowerMagazine")
+        UsdGeom.Imageable(prim).MakeVisible()
+        hoist = stage.GetPrimAtPath(p + "/Hoist_Unit")
+        hoist_attr = hoist.GetAttribute("xformOp:translate:hoistDrop") if hoist.IsValid() else None
+        prims.append((prim.GetAttribute("xformOp:translate:oht"),
+                      prim.GetAttribute("xformOp:orient:oht"),
+                      hoist_attr, prim))
+    if HIDE_TEMPLATE:
+        UsdGeom.Imageable(tmpl).MakeInvisible()
+
+    # hoist: convert world metres to the model's local units
+    # (the template uses xformOp:scale:oht = 0.01, so 1 m = 100 local units)
+    hoist_scale = 1.0
+    sc = prims[0][3].GetAttribute("xformOp:scale:oht")
+    if sc and sc.Get() is not None and abs(sc.Get()[2]) > 1e-9:
+        hoist_scale = abs(sc.Get()[2])
+    drop_local = drop_m / hoist_scale
+
+    if SHOW_ROUTE:
+        c = UsdGeom.BasisCurves.Define(stage, FLEET_PATH + "/Route_Debug")
+        pts = [Gf.Vec3f(x, y, 0.065) for x, y in path.xy] + [Gf.Vec3f(path.xy[0][0], path.xy[0][1], 0.065)]
+        c.CreatePointsAttr(Vt.Vec3fArray(pts))
+        c.CreateCurveVertexCountsAttr([len(pts)])
+        c.CreateTypeAttr("linear")
+        c.CreateWidthsAttr([0.03])
+        c.CreateDisplayColorAttr([Gf.Vec3f(0.1, 0.8, 0.2)])
+
+    stations_s = []
+    for st in STATIONS:
+        s, off = path.project(st["xy"])
+        if off > 0.5:
+            print("[OHT Fleet] station %s is %.2f m off the route — check its xy" % (st["name"], off))
+        stations_s.append(s)
+
+    sim = FleetSim(path, NUM_OHT, veh_len, stations_s)
+    timeline = omni.timeline.get_timeline_interface()
+    yaw_off = math.radians(YAW_OFFSET_DEG)
+
+    def write_poses():
+        with Sdf.ChangeBlock():
+            for v, (t_a, o_a, h_a, _) in zip(sim.veh, prims):
+                x, y, yaw = path.pose(v.s)
+                t_a.Set(Gf.Vec3d(x, y, oht_z))
+                half = (yaw + yaw_off) / 2
+                q = Gf.Quatd(math.cos(half), 0, 0, math.sin(half)) * base_q
+                o_a.Set(q)
+                if h_a:
+                    h_a.Set(Gf.Vec3d(0, 0, -drop_local * v.hoist))
+
+    write_poses()
+
+    # Kinematic physics: if the OHT model has rigid bodies, physics would
+    # overwrite our positions every frame and the OHTs would not move.
+    n_kin = 0
+    for _, _, _, prim in prims:
+        for p in Usd.PrimRange(prim):
+            if p.HasAPI(UsdPhysics.RigidBodyAPI):
+                UsdPhysics.RigidBodyAPI(p).CreateKinematicEnabledAttr(True)
+                n_kin += 1
+    if n_kin:
+        print("[OHT Fleet] set %d rigid bodies to kinematic" % n_kin)
+
+    import time
+    import traceback
+
+    class _Handle:
+        def __init__(self):
+            self.sim = sim
+            self.last = None
+            self.errors = 0
+            self.frames = 0
+            self.sub = None
+            self.observer = None
+            try:   # Kit 105/106 (Isaac Sim 4.x)
+                self.sub = omni.kit.app.get_app().get_update_event_stream().create_subscription_to_pop(
+                    self._on_update, name="oht_fleet_controller")
+            except Exception:   # newer Kit (Isaac Sim 5.x)
+                import carb.eventdispatcher
+                self.observer = carb.eventdispatcher.get_eventdispatcher().observe_event(
+                    event_name=omni.kit.app.GLOBAL_EVENT_UPDATE,
+                    on_event=self._on_update, observer_name="oht_fleet_controller")
+
+        def _on_update(self, *_):
+            now = time.perf_counter()
+            dt = 0.0 if self.last is None else now - self.last
+            self.last = now
+            if RUN_ONLY_WHEN_PLAYING and not timeline.is_playing():
+                return
+            try:
+                self.sim.step(dt)
+                write_poses()
+                self.frames += 1
+                if self.frames == 30:
+                    v = self.sim.veh[0]
+                    print("[OHT Fleet] running — OHT_01 speed %.2f m/s, state %s" % (v.v, v.state))
+            except Exception:
+                self.errors += 1
+                if self.errors <= 3:
+                    print("[OHT Fleet] ERROR in update:\n" + traceback.format_exc())
+
+        def stop(self):
+            if self.sub:
+                self.sub.unsubscribe()
+                self.sub = None
+            self.observer = None
+            print("[OHT Fleet] stopped")
+
+    builtins._oht_fleet = _Handle()
+    print("[OHT Fleet] %d OHTs on a %.1f m loop, vehicle length %.2f m, hoist drop %.2f m, OHT z %.3f.%s"
+          % (NUM_OHT, path.length, veh_len, drop_m, oht_z,
+             " Press PLAY." if RUN_ONLY_WHEN_PLAYING else " Moving now."))
+
+
+try:
+    import omni.usd  # noqa: F401
+    _run_in_omniverse()
+except ImportError:
+    pass   # imported outside Omniverse (e.g. for offline testing)
