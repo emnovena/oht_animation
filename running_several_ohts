@@ -95,6 +95,7 @@ MAGAZINES_PATH    = "/World/Magazines"
 NUM_MAGAZINES     = None       # None = half of the machines
 HIDE_ORIGINAL_MAGAZINE = True  # hide /World/full (the copies replace it)
 CLAW_CLOSE_M      = 0.05       # how far each claw moves inward when gripping
+CARRY_RAISE_M      = 0.15       # raise the magazine this much above the machine port
 
 LOG_JOBS      = True           # print pick/drop events in the console
 HOIST_DROP_M  = None           # None = auto: measured so the claw tips reach
@@ -106,7 +107,7 @@ GRIP_TIME_S   = 3.0
 
 YAW_OFFSET_DEG = 0.0         # set to 180 if the models drive backwards
 RUN_ONLY_WHEN_PLAYING = False   # True = move only while the timeline is playing
-OHT_Z_OFFSET_M = -0.3        # raise(+)/lower(-) all OHTs. If they sit ON TOP of
+OHT_Z_OFFSET_M = -0.04       # raise(+)/lower(-) all OHTs. If they sit ON TOP of
                              # the rail instead of hanging under it, try -0.3
 SHOW_ROUTE    = True
 
@@ -745,7 +746,15 @@ def _run_in_omniverse():
                     ax, ay, az, ayaw = m["attach"]
                     gx, gy, gz, gyaw = _gripper(v)
                     c, s_ = math.cos(gyaw), math.sin(gyaw)
-                    m["pose"] = (gx + c * ax - s_ * ay, gy + s_ * ax + c * ay, gz + az, gyaw + ayaw)
+                    # Gradually pull the magazine upward as the hoist rises
+                    stow_z = CARRY_RAISE_M * (1.0 - v.hoist)
+
+                    m["pose"] = (
+                        gx + c * ax - s_ * ay,
+                        gy + s_ * ax + c * ay,
+                        gz + az + stow_z,
+                        gyaw + ayaw
+                    )
                     _set_mag_pose(m, *m["pose"])
             _update_cables()
 
