@@ -95,6 +95,7 @@ MAGAZINES_PATH    = "/World/Magazines"
 NUM_MAGAZINES     = None       # None = half of the machines
 HIDE_ORIGINAL_MAGAZINE = True  # hide /World/full (the copies replace it)
 CLAW_CLOSE_M      = 0.05       # how far each claw moves inward when gripping
+CARRY_RAISE_M = 0.15
 
 LOG_JOBS      = True           # print pick/drop events in the console
 HOIST_DROP_M  = 2.75           # only a fallback now: on every pick the hoist
@@ -791,7 +792,14 @@ def _run_in_omniverse():
                     ax, ay, az, ayaw = m["attach"]
                     gx, gy, gz, gyaw = _gripper(v)
                     c, s_ = math.cos(gyaw), math.sin(gyaw)
-                    m["pose"] = (gx + c * ax - s_ * ay, gy + s_ * ax + c * ay, gz + az, gyaw + ayaw)
+
+                    # Keep the magazine attached to the gripper
+                    m["pose"] = (
+                        gx + c * ax - s_ * ay,
+                        gy + s_ * ax + c * ay,
+                        gz + az,
+                        gyaw + ayaw
+                    )
                     _set_mag_pose(m, *m["pose"])
             _update_cables()
 
