@@ -95,13 +95,14 @@ MAGAZINES_PATH    = "/World/Magazines"
 NUM_MAGAZINES     = None       # None = half of the machines
 HIDE_ORIGINAL_MAGAZINE = True  # hide /World/full (the copies replace it)
 CLAW_CLOSE_M      = 0.05       # how far each claw moves inward when gripping
-CARRY_RAISE_M      = 0.15       # raise the magazine this much above the machine port
 
 LOG_JOBS      = True           # print pick/drop events in the console
-HOIST_DROP_M  = None           # None = auto: measured so the claw tips reach
-                               # GRIP_DEPTH_M below the top of the magazine.
-                               # Or a number in metres to set it yourself.
-GRIP_DEPTH_M  = 0.05
+HOIST_DROP_M  = 2.75           # only a fallback now: on every pick the hoist
+                               # length is measured from the real claw and
+                               # magazine geometry, on every drop it lowers
+                               # exactly onto the machine.
+GRIP_DEPTH_M  = 0.05           # how far the claw tips go below the magazine top
+CENTER_UNDER_CLAWS = True      # place magazines exactly under the claws
 HOIST_TIME_S  = 3.4            # lowering time (same for raising)
 GRIP_TIME_S   = 3.0
 
@@ -118,7 +119,7 @@ CABLE_WIDTH_M    = 0.012
 CABLE_COLOR      = (0.1, 0.1, 0.1)
 
 # Performance
-MAGAZINE_INSTANCEABLE = True   # draw magazine copies as instances: moving a
+MAGAZINE_INSTANCEABLE = False  # draw magazine copies as instances: moving a
                                # magazine updates 1 transform instead of every
                                # mesh inside it (this was the lag on pick/drop)
 MAX_SUBSTEP_S = 0.02           # simulation substep; slow frames are caught up
@@ -255,6 +256,7 @@ class Vehicle:
         self.mag = None           # magazine id being carried, or None
         self.action = None        # "pick" / "drop" while working at a machine
         self.claw = 0.0           # 0 = open, 1 = closed
+        self.drop = None          # hoist length for the current job (m)
 
 
 class FleetSim:
@@ -271,6 +273,7 @@ class FleetSim:
         self.veh = [Vehicle(i, i * spacing) for i in range(n)]
         self.min_gap_seen = 1e9
         self.on_event = None        # callback(vehicle, machine_index, "pick"/"drop", magazine_id)
+        self.on_arrive = None       # callback(vehicle, machine_index, action) before lowering
         for v in self.veh:
             self._next_target(v)
 
@@ -350,6 +353,8 @@ class FleetSim:
                         v.action = "drop"
                     else:
                         v.action = None
+                    if self.on_arrive:
+                        self.on_arrive(v, k, v.action)
                     continue
             v_target = min(V_MAX, v_lead_lim, v_curve, v_stn)
             if v_target >= v.v:
@@ -451,7 +456,7 @@ def _run_in_omniverse():
         except Exception:
             pass
 
-    drop_m = HOIST_DROP_M if HOIST_DROP_M is not None else 2.5
+    drop_m = HOIST_DROP_M if HOIST_DROP_M is not None else 2.5    # fallback only
 
     # ---- fleet prims
     fleet = UsdGeom.Xform.Define(stage, FLEET_PATH).GetPrim()
@@ -485,6 +490,31 @@ def _run_in_omniverse():
                       hoist_attr, prim, claws))
     if HIDE_TEMPLATE:
         UsdGeom.Imageable(tmpl).MakeInvisible()
+
+    def _qyaw(q):
+        return 2 * math.atan2(q.GetImaginary()[2], q.GetReal())
+    base_yaw = _qyaw(base_q)
+    yaw_off = math.radians(YAW_OFFSET_DEG)
+
+    def _bbox(prim):
+        try:
+            c_ = UsdGeom.BBoxCache(Usd.TimeCode.Default(), [UsdGeom.Tokens.default_, UsdGeom.Tokens.render])
+            r = c_.ComputeWorldBound(prim).ComputeAlignedRange()
+            return None if r.IsEmpty() else r
+        except Exception:
+            return None
+
+    # where the claws are relative to the OHT origin, in the OHT's travel frame
+    claw_off = (0.0, 0.0)
+    hu0 = stage.GetPrimAtPath(FLEET_PATH + "/OHT_01/Hoist_Unit")
+    r_h = _bbox(hu0) if hu0.IsValid() else None
+    if r_h is not None and CENTER_UNDER_CLAWS:
+        o0 = prims[0][0].Get()
+        cx, cy = (r_h.GetMin()[0] + r_h.GetMax()[0]) / 2, (r_h.GetMin()[1] + r_h.GetMax()[1]) / 2
+        th = -(_qyaw(prims[0][1].Get()) - base_yaw - yaw_off)
+        dx, dy = cx - o0[0], cy - o0[1]
+        claw_off = (math.cos(th) * dx - math.sin(th) * dy, math.sin(th) * dx + math.cos(th) * dy)
+        print("[OHT Fleet] claws are %.3f m / %.3f m from the OHT origin" % claw_off)
 
     # hoist: convert world metres to the model's local units
     # (the template uses xformOp:scale:oht = 0.01, so 1 m = 100 local units)
@@ -577,7 +607,9 @@ def _run_in_omniverse():
             continue
         stations_s.append(s)
         station_names.append(m.GetName())
-        x, y, _ = path.pose(s)            # magazine sits right under the OHT stop
+        x, y, pyaw = path.pose(s)         # magazine sits right under the claws
+        x += math.cos(pyaw) * claw_off[0] - math.sin(pyaw) * claw_off[1]
+        y += math.sin(pyaw) * claw_off[0] + math.cos(pyaw) * claw_off[1]
         slots.append((x, y, port[2], _yaw_of(m)))
     print("[OHT Fleet] %d ground machines used as stops: %s" % (len(stations_s), ", ".join(station_names)))
 
@@ -632,9 +664,46 @@ def _run_in_omniverse():
     for m in mags:
         _set_mag_pose(m, *m["pose"])
 
+    # the magazine's origin may not be its centre: shift so the CENTRE is under the claws
+    if mags and CENTER_UNDER_CLAWS:
+        r_m = _bbox(stage.GetPrimAtPath(MAGAZINES_PATH + "/MAG_01"))
+        if r_m is not None:
+            mx0, my0, _, myaw0 = mags[0]["pose"]
+            cx, cy = (r_m.GetMin()[0] + r_m.GetMax()[0]) / 2, (r_m.GetMin()[1] + r_m.GetMax()[1]) / 2
+            dx, dy = cx - mx0, cy - my0
+            loc = (math.cos(-myaw0) * dx - math.sin(-myaw0) * dy, math.sin(-myaw0) * dx + math.cos(-myaw0) * dy)
+            def _shift(pose):
+                x, y, z, yaw = pose
+                return (x - (math.cos(yaw) * loc[0] - math.sin(yaw) * loc[1]),
+                        y - (math.sin(yaw) * loc[0] + math.cos(yaw) * loc[1]), z, yaw)
+            slots = [_shift(sl) for sl in slots]
+            for m in mags:
+                m["pose"] = _shift(m["pose"])
+                _set_mag_pose(m, *m["pose"])
+
+    def _vdrop(v):
+        return v.drop if v.drop is not None else drop_m
+
     def _gripper(v):
         x, y, yaw = path.pose(v.s)
-        return x, y, oht_z - drop_m * v.hoist, yaw
+        return x, y, oht_z - _vdrop(v) * v.hoist, yaw
+
+    def on_arrive(v, k, action):
+        """Decide how far to lower for this job, from the real geometry."""
+        v.drop = drop_m
+        if action == "drop" and v.mag is not None and v.mag < len(mags):
+            # lower exactly until the carried magazine is back at machine height
+            v.drop = max(0.05, mags[v.mag]["pose"][2] - slots[k][2])
+        elif action == "pick" and machine_mag_of(k) is not None:
+            hu = stage.GetPrimAtPath("%s/OHT_%02d/Hoist_Unit" % (FLEET_PATH, v.idx + 1))
+            mag_prim = stage.GetPrimAtPath("%s/MAG_%02d" % (MAGAZINES_PATH, machine_mag_of(k) + 1))
+            r_h, r_m = _bbox(hu), _bbox(mag_prim)
+            if r_h is not None and r_m is not None:
+                d = r_h.GetMin()[2] - (r_m.GetMax()[2] - GRIP_DEPTH_M)
+                if 0.1 < d < 10:
+                    v.drop = d
+        if LOG_JOBS and action:
+            print("[OHT Fleet] OHT_%02d lowering %.2f m to %s" % (v.idx + 1, v.drop, action))
 
     def on_event(v, k, kind, mag_id):
         if mag_id is None or mag_id >= len(mags):
@@ -653,39 +722,15 @@ def _run_in_omniverse():
             print("[OHT Fleet] OHT_%02d %s MAG_%02d at %s"
                   % (v.idx + 1, "picked up" if kind == "pick" else "dropped off", mag_id + 1, station_names[k]))
 
-    # ---- auto hoist length: claw tips (hoist up) -> top of a magazine on a machine
-    if HOIST_DROP_M is None and mags:
-        try:
-            cache = UsdGeom.BBoxCache(Usd.TimeCode.Default(), [UsdGeom.Tokens.default_, UsdGeom.Tokens.render])
-            hu = stage.GetPrimAtPath(FLEET_PATH + "/OHT_01/Hoist_Unit")
-            first_mag = stage.GetPrimAtPath(MAGAZINES_PATH + "/MAG_01")
-            prims[0][0].Set(Gf.Vec3d(0, 0, oht_z))          # hoist fully up
-            if hu.IsValid():
-                prims[0][2] and prims[0][2].Set(Gf.Vec3d(0, 0, 0))
-            claw_bottom = cache.ComputeWorldBound(hu).ComputeAlignedRange()
-            mag_box = cache.ComputeWorldBound(first_mag).ComputeAlignedRange()
-            if not claw_bottom.IsEmpty() and not mag_box.IsEmpty():
-                d = claw_bottom.GetMin()[2] - (mag_box.GetMax()[2] - GRIP_DEPTH_M)
-                if 0.1 < d < 10:
-                    drop_m = d
-                    print("[OHT Fleet] hoist length measured: %.2f m (claw tips to magazine top)" % d)
-                else:
-                    print("[OHT Fleet] hoist auto-measure gave %.2f m — using %.2f m; set HOIST_DROP_M" % (d, drop_m))
-            else:
-                print("[OHT Fleet] could not measure hoist/magazine (payload not loaded?) — using %.2f m" % drop_m)
-        except Exception as ex:
-            print("[OHT Fleet] hoist auto-measure failed (%s) — using %.2f m" % (ex, drop_m))
     drop_local = drop_m / hoist_scale
 
     sim = FleetSim(path, NUM_OHT, veh_len, stations_s, machine_mag)
     sim.on_event = on_event
+    sim.on_arrive = on_arrive
+    machine_mag_of = lambda k: sim.machine_mag[k]
     timeline = omni.timeline.get_timeline_interface()
-    yaw_off = math.radians(YAW_OFFSET_DEG)
 
     # ---- hoist cables: attach points in the OHT's own frame
-    def _qyaw(q):
-        return 2 * math.atan2(q.GetImaginary()[2], q.GetReal())
-    base_yaw = _qyaw(base_q)
     cable_pts_local = None          # list of (dx, dy, dz_top) in model frame
     ct = stage.GetPrimAtPath(CABLE_TEMPLATE)
     t_pos = tmpl.GetAttribute("xformOp:translate:oht").Get()
@@ -722,7 +767,7 @@ def _run_in_omniverse():
             x, y, yaw = path.pose(v.s)
             th = yaw + yaw_off + base_yaw          # model yaw of this OHT
             c_, s2 = math.cos(th), math.sin(th)
-            length = max(1e-4, drop_m * v.hoist + 0.002)
+            length = max(1e-4, _vdrop(v) * v.hoist + 0.002)
             for (dx, dy, dz), (t_op, s_op) in zip(cable_pts_local, ops):
                 top = oht_z + dz
                 t_op.Set(Gf.Vec3d(x + c_ * dx - s2 * dy, y + s2 * dx + c_ * dy, top - length / 2))
@@ -737,7 +782,7 @@ def _run_in_omniverse():
                 q = Gf.Quatd(math.cos(half), 0, 0, math.sin(half)) * base_q
                 o_a.Set(q)
                 if h_a:
-                    h_a.Set(Gf.Vec3d(0, 0, -drop_local * v.hoist))
+                    h_a.Set(Gf.Vec3d(0, 0, -_vdrop(v) / hoist_scale * v.hoist))
                 for c_attr, rest in claws:      # move each claw toward the centre
                     inward = -1.0 if rest[0] > 0 else 1.0
                     c_attr.Set(Gf.Vec3d(rest[0] + inward * CLAW_CLOSE_M * v.claw, rest[1], rest[2]))
@@ -746,15 +791,7 @@ def _run_in_omniverse():
                     ax, ay, az, ayaw = m["attach"]
                     gx, gy, gz, gyaw = _gripper(v)
                     c, s_ = math.cos(gyaw), math.sin(gyaw)
-                    # Gradually pull the magazine upward as the hoist rises
-                    stow_z = CARRY_RAISE_M * (1.0 - v.hoist)
-
-                    m["pose"] = (
-                        gx + c * ax - s_ * ay,
-                        gy + s_ * ax + c * ay,
-                        gz + az + stow_z,
-                        gyaw + ayaw
-                    )
+                    m["pose"] = (gx + c * ax - s_ * ay, gy + s_ * ax + c * ay, gz + az, gyaw + ayaw)
                     _set_mag_pose(m, *m["pose"])
             _update_cables()
 
