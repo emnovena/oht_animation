@@ -31,7 +31,8 @@ import builtins
 # ---------------------------------------------------------------------------
 # SETTINGS
 # ---------------------------------------------------------------------------
-TEMPLATE_PATH = "/World/OHT2grip_Revised"   # OHT model to copy
+TEMPLATE_PATH = "/World/OHT_Vehicle"       # OHT model to copy (made by build_oht_vehicle.py)
+OLD_TEMPLATE_PATH = "/World/OHT2grip_Revised"   # used if the new vehicle isn't built yet
 FLEET_PATH    = "/World/OHT_Fleet"
 NUM_OHT       = 4            # 3+ vehicles; capacity check is done on start
 HIDE_TEMPLATE = True
@@ -87,6 +88,14 @@ NEW_MACHINE_PORTS = [
 PORT_OFFSET_LOCAL = (0.29, -0.07, 0.77)
 SKIP_OVERLAPPING_MACHINES = True   # don't place a machine that would overlap another
 
+# Keep what you placed by hand. True: if /World/Ground_Machines or
+# /World/Magazines already exist, they are used exactly where they are
+# (move/rotate them in the viewport, then re-run). Each magazine belongs to the
+# nearest machine, and the OHT stops exactly above the magazine.
+# False: rebuild both from NEW_MACHINE_PORTS (your manual moves are lost).
+KEEP_SCENE_LAYOUT = True
+MAG_MATCH_RADIUS_M = 1.0       # a magazine belongs to a machine if it is this close
+
 # Magazines (the carriers the OHTs grab). Copies of MAGAZINE_TEMPLATE are put
 # on every other ground machine. An empty OHT is sent to the nearest machine
 # that has a magazine, grabs it, then carries it to the nearest empty machine.
@@ -94,7 +103,9 @@ MAGAZINE_TEMPLATE = "/World/full"
 MAGAZINES_PATH    = "/World/Magazines"
 NUM_MAGAZINES     = None       # None = half of the machines
 HIDE_ORIGINAL_MAGAZINE = True  # hide /World/full (the copies replace it)
-CLAW_CLOSE_M      = 0.05       # how far each claw moves inward when gripping
+CLAW_CLOSE_M      = 0.05       # how far each claw moves INWARD to grip the magazine
+CLAW_OPEN_M       = 0.04       # how far each claw opens OUTWARD before gripping and
+                               # when releasing (then it closes back to rest)
 
 LOG_JOBS      = True           # print pick/drop events in the console
 HOIST_DROP_M  = 2.75           # only a fallback now: on every pick the hoist
@@ -114,7 +125,7 @@ GRIP_TIME_S   = 3.0
 
 YAW_OFFSET_DEG = 0.0         # set to 180 if the models drive backwards
 RUN_ONLY_WHEN_PLAYING = False   # True = move only while the timeline is playing
-OHT_Z_OFFSET_M = -0.04       # raise(+)/lower(-) all OHTs. If they sit ON TOP of
+OHT_Z_OFFSET_M = 0.0         # raise(+)/lower(-) all OHTs. If they sit ON TOP of
                              # the rail instead of hanging under it, try -0.3
 SHOW_ROUTE    = True
 
@@ -125,11 +136,15 @@ CABLE_WIDTH_M    = 0.012
 CABLE_COLOR      = (0.1, 0.1, 0.1)
 
 # Performance
-MAGAZINE_INSTANCEABLE = True   # draw magazine copies as instances: moving a
+MAGAZINE_INSTANCEABLE = False  # draw magazine copies as instances: moving a
                                # magazine updates 1 transform instead of every
                                # mesh inside it (this was the lag on pick/drop)
 MAX_SUBSTEP_S = 0.02           # simulation substep; slow frames are caught up
                                # instead of slowing the OHTs down
+KINEMATIC_COLLIDERS = True     # moving OHTs/magazines with collision shapes become
+                               # kinematic bodies, so PhysX moves them cheaply
+                               # instead of rebuilding static colliders every frame
+PROFILE_EVERY_S = 5.0          # print FPS and how much time the script uses (0 = off)
 
 
 # ---------------------------------------------------------------------------
@@ -261,7 +276,8 @@ class Vehicle:
         self.target_dist = 0.0
         self.mag = None           # magazine id being carried, or None
         self.action = None        # "pick" / "drop" while working at a machine
-        self.claw = 0.0           # 0 = open, 1 = closed
+        self.claw = 0.0           # claw position (m): 0 = rest, + = closed/gripping,
+                                  # - = opened outward
         self.drop = None          # hoist length for the current job (m)
 
 
@@ -389,14 +405,16 @@ class FleetSim:
         k = v.target[0]
         if v.state == "lower":
             v.hoist = _ease(v.timer / HOIST_TIME_S)
+            if v.action == "pick":         # open the claws on the way down
+                v.claw = -CLAW_OPEN_M * _ease(v.timer / (0.4 * HOIST_TIME_S))
             if v.timer >= HOIST_TIME_S:
                 v.state, v.timer, v.hoist = "grip", 0.0, 1.0
         elif v.state == "grip":
             f = _ease(v.timer / GRIP_TIME_S)
-            if v.action == "pick":
-                v.claw = f                 # close around the magazine
-            elif v.action == "drop":
-                v.claw = 1.0 - f           # open to release it
+            if v.action == "pick":         # open -> closed around the magazine
+                v.claw = -CLAW_OPEN_M + (CLAW_CLOSE_M + CLAW_OPEN_M) * f
+            elif v.action == "drop":       # closed -> open to release it
+                v.claw = CLAW_CLOSE_M - (CLAW_CLOSE_M + CLAW_OPEN_M) * f
             if v.timer >= GRIP_TIME_S:
                 if v.action == "pick":
                     v.mag, self.machine_mag[k] = self.machine_mag[k], None
@@ -410,6 +428,8 @@ class FleetSim:
                 v.state, v.timer = "raise", 0.0
         elif v.state == "raise":
             v.hoist = 1.0 - _ease(v.timer / HOIST_TIME_S)
+            if v.action == "drop":         # clear of the magazine: close back to rest
+                v.claw = -CLAW_OPEN_M * (1.0 - _ease((v.timer / HOIST_TIME_S - 0.1) / 0.5))
             if v.timer >= HOIST_TIME_S:
                 v.state, v.hoist, v.action = "drive", 0.0, None
                 self._next_target(v)
@@ -428,8 +448,38 @@ def _run_in_omniverse():
     if old is not None:
         old.stop()
 
+    class _W:
+        """Fast attribute writer: skips unchanged values and writes straight to
+        the layer (Sdf) instead of through Usd, which is much cheaper per frame."""
+        __slots__ = ("attr", "spec", "cls", "last")
+
+        def __init__(self, attr):
+            self.attr, self.spec, self.last = attr, None, None
+            self.cls = attr.GetTypeName().type.pythonClass
+
+        def set(self, value):
+            if self.cls is not None and not isinstance(value, self.cls):
+                value = self.cls(value)
+            if value == self.last:
+                return
+            self.last = value
+            if self.spec is None:
+                self.attr.Set(value)            # first write creates the spec
+                layer = stage.GetEditTarget().GetLayer()
+                self.spec = layer.GetAttributeAtPath(self.attr.GetPath()) or False
+            elif self.spec:
+                self.spec.default = value
+            else:
+                self.attr.Set(value)
+
     stage = omni.usd.get_context().get_stage()
     tmpl = stage.GetPrimAtPath(TEMPLATE_PATH)
+    template_path = TEMPLATE_PATH
+    if not tmpl.IsValid():
+        tmpl = stage.GetPrimAtPath(OLD_TEMPLATE_PATH)
+        template_path = OLD_TEMPLATE_PATH
+        print("[OHT Fleet] %s not found (run build_oht_vehicle.py first) — using %s"
+              % (TEMPLATE_PATH, OLD_TEMPLATE_PATH))
     if not tmpl.IsValid():
         raise RuntimeError("Template prim not found: " + TEMPLATE_PATH)
 
@@ -471,7 +521,7 @@ def _run_in_omniverse():
 
     src_layer = None
     for layer in stage.GetLayerStack():
-        if layer.GetPrimAtPath(TEMPLATE_PATH):
+        if layer.GetPrimAtPath(template_path):
             src_layer = layer
             break
     dst_layer = stage.GetEditTarget().GetLayer()
@@ -479,7 +529,7 @@ def _run_in_omniverse():
     prims = []
     for i in range(NUM_OHT):
         p = "%s/OHT_%02d" % (FLEET_PATH, i + 1)
-        Sdf.CopySpec(src_layer, TEMPLATE_PATH, dst_layer, p)
+        Sdf.CopySpec(src_layer, template_path, dst_layer, p)
         prim = stage.GetPrimAtPath(p)
         prim.ClearCustomDataByKey("ohtFollowerMagazine")
         UsdGeom.Imageable(prim).MakeVisible()
@@ -490,7 +540,7 @@ def _run_in_omniverse():
             cp = stage.GetPrimAtPath(p + "/Hoist_Unit/" + name)
             if cp.IsValid() and cp.GetAttribute("xformOp:translate").Get() is not None:
                 a = cp.GetAttribute("xformOp:translate")
-                claws.append((a, Gf.Vec3d(a.Get())))
+                claws.append((_W(a), Gf.Vec3d(a.Get())))
         prims.append((prim.GetAttribute("xformOp:translate:oht"),
                       prim.GetAttribute("xformOp:orient:oht"),
                       hoist_attr, prim, claws))
@@ -565,16 +615,22 @@ def _run_in_omniverse():
         c.CreateDisplayColorAttr([Gf.Vec3f(0.1, 0.8, 0.2)])
 
     # ---- ground machines -> stations
+    def _world(prim):
+        """(x, y, z, yaw) of a prim in world space, from its full transform"""
+        m = Gf.Matrix4d(1.0)             # walk up the hierarchy (also works if a model
+        p = prim                         # didn't load and its prim has no type)
+        while p and p.GetPath() != Sdf.Path.absoluteRootPath:
+            m = m * UsdGeom.Xformable(p).GetLocalTransformation(Usd.TimeCode.Default())
+            p = p.GetParent()
+        t = m.ExtractTranslation()
+        return t[0], t[1], t[2], math.atan2(m[0][1], m[0][0])
+
     def _yaw_of(prim):
-        o = prim.GetAttribute("xformOp:orient")
-        if o and o.Get() is not None:
-            q = o.Get()
-            return 2 * math.atan2(q.GetImaginary()[2], q.GetReal())
-        return 0.0
+        return _world(prim)[3]
 
     def _port_of(prim):
-        t = prim.GetAttribute("xformOp:translate").Get()
-        yaw = _yaw_of(prim)
+        t = _world(prim)
+        yaw = t[3]
         ox, oy, oz = PORT_OFFSET_LOCAL
         c, s_ = math.cos(yaw), math.sin(yaw)
         return (t[0] + c * ox - s_ * oy, t[1] + s_ * ox + c * oy, t[2] + oz)
@@ -597,9 +653,14 @@ def _run_in_omniverse():
     machines = [m for m in machines if m.IsValid()]
     gm_tmpl = stage.GetPrimAtPath(GROUND_MACHINE_TEMPLATE)
     gm_root = stage.GetPrimAtPath(GROUND_MACHINES_PATH)
-    if gm_root.IsValid():
+    keep_machines = KEEP_SCENE_LAYOUT and gm_root.IsValid() and len(gm_root.GetChildren()) > 0
+    if keep_machines:
+        kept = sorted(gm_root.GetChildren(), key=lambda p: p.GetName())
+        machines += kept
+        print("[OHT Fleet] keeping your %d machines in %s where they are" % (len(kept), GROUND_MACHINES_PATH))
+    elif gm_root.IsValid():
         stage.RemovePrim(gm_root.GetPath())
-    if gm_tmpl.IsValid() and NEW_MACHINE_PORTS:
+    if not keep_machines and gm_tmpl.IsValid() and NEW_MACHINE_PORTS:
         UsdGeom.Xform.Define(stage, GROUND_MACHINES_PATH)
         gm_layer = None
         for layer in stage.GetLayerStack():
@@ -646,14 +707,58 @@ def _run_in_omniverse():
 
     # ---- magazines
     mag_root = stage.GetPrimAtPath(MAGAZINES_PATH)
-    if mag_root.IsValid():
-        stage.RemovePrim(mag_root.GetPath())
     mag_tmpl = stage.GetPrimAtPath(MAGAZINE_TEMPLATE)
     n_mag = NUM_MAGAZINES if NUM_MAGAZINES is not None else len(stations_s) // 2
     n_mag = max(0, min(n_mag, len(stations_s) - 1))
     machine_mag = [None] * len(stations_s)
     mags = []          # per magazine: dict(t=translate attr, o=orient attr, pose=(x,y,z,yaw))
-    if mag_tmpl.IsValid() and n_mag > 0:
+    kept_slots = set()
+    existing = sorted(mag_root.GetChildren(), key=lambda p: p.GetName()) \
+        if (KEEP_SCENE_LAYOUT and mag_root.IsValid()) else []
+    if existing:
+        for mp in existing:
+            x, y, z, yaw = _world(mp)
+            free = [k for k in range(len(slots)) if machine_mag[k] is None]
+            if not free:
+                print("[OHT Fleet] %s: no free machine left — not used" % mp.GetName())
+                continue
+            k = min(free, key=lambda k: math.hypot(slots[k][0] - x, slots[k][1] - y))
+            dist = math.hypot(slots[k][0] - x, slots[k][1] - y)
+            if dist > MAG_MATCH_RADIUS_M:
+                print("[OHT Fleet] %s at (%.2f, %.2f) is %.2f m from the nearest machine (%s) — not used. "
+                      "Move it onto a machine, or move a machine under it." % (mp.GetName(), x, y, dist, station_names[k]))
+                continue
+            if abs(z - slots[k][2]) > 0.3:       # was left hanging mid-air: put it on the machine
+                z = slots[k][2]
+            # simple world-space transform: translate + orient (+ scale)
+            if not mp.GetAttribute("xformOp:orient"):
+                mp.CreateAttribute("xformOp:orient", Sdf.ValueTypeNames.Quatd)
+            order = ["xformOp:translate", "xformOp:orient"]
+            if mp.GetAttribute("xformOp:scale"):
+                order.append("xformOp:scale")
+            mp.GetAttribute("xformOpOrder").Set(Vt.TokenArray(order))
+            UsdGeom.Imageable(mp).MakeVisible()
+            if MAGAZINE_INSTANCEABLE:
+                mp.SetInstanceable(True)
+            mags.append({"t": _W(mp.GetAttribute("xformOp:translate")), "o": _W(mp.GetAttribute("xformOp:orient")),
+                         "pose": (x, y, z, yaw), "attach": None, "prim": mp})
+            machine_mag[k] = len(mags) - 1
+            slots[k] = (x, y, z, yaw)
+            kept_slots.add(k)
+            # the OHT stops so that its claws are exactly above this magazine
+            s0, _ = path.project((x, y))
+            pyaw = path.pose(s0)[2]
+            sx = x - (math.cos(pyaw) * claw_off[0] - math.sin(pyaw) * claw_off[1])
+            sy = y - (math.sin(pyaw) * claw_off[0] + math.cos(pyaw) * claw_off[1])
+            stations_s[k] = path.project((sx, sy))[0]
+        if HIDE_ORIGINAL_MAGAZINE and mag_tmpl.IsValid():
+            UsdGeom.Imageable(mag_tmpl).MakeInvisible()
+        print("[OHT Fleet] keeping your %d magazines where they are: %s"
+              % (len(mags), ", ".join("%s on %s" % (mags[machine_mag[k]]["prim"].GetName(), station_names[k])
+                                      for k in range(len(slots)) if machine_mag[k] is not None)))
+    elif mag_root.IsValid():
+        stage.RemovePrim(mag_root.GetPath())
+    if not existing and mag_tmpl.IsValid() and n_mag > 0:
         UsdGeom.Xform.Define(stage, MAGAZINES_PATH)
         mag_layer = next((l for l in stage.GetLayerStack() if l.GetPrimAtPath(MAGAZINE_TEMPLATE)), None)
         # spread magazines over the machines: 0, 2, 4, ...
@@ -673,31 +778,27 @@ def _run_in_omniverse():
             if mp.HasAttribute("xformOp:transform:carry"):
                 mp.RemoveProperty("xformOp:transform:carry")
             o_attr = mp.GetAttribute("xformOp:orient")
-            mags.append({"t": mp.GetAttribute("xformOp:translate"), "o": o_attr,
-                         "quatf": str(o_attr.GetTypeName()) == "quatf",
-                         "pose": slots[k], "attach": None})
+            mags.append({"t": _W(mp.GetAttribute("xformOp:translate")), "o": _W(o_attr),
+                         "pose": slots[k], "attach": None, "prim": mp})
             machine_mag[k] = m_i
         if HIDE_ORIGINAL_MAGAZINE:
             UsdGeom.Imageable(mag_tmpl).MakeInvisible()
         print("[OHT Fleet] %d magazines placed on: %s"
               % (n_mag, ", ".join(station_names[k] for k in range(len(stations_s)) if machine_mag[k] is not None)))
-    elif n_mag > 0:
+    elif not existing and n_mag > 0:
         print("[OHT Fleet] magazine template %s not found — OHTs will only move the hoist" % MAGAZINE_TEMPLATE)
 
     def _set_mag_pose(m, x, y, z, yaw):
-        m["t"].Set(Gf.Vec3d(x, y, z))
+        m["t"].set(Gf.Vec3d(x, y, z))
         h = yaw / 2
-        if m["quatf"]:
-            m["o"].Set(Gf.Quatf(math.cos(h), 0, 0, math.sin(h)))
-        else:
-            m["o"].Set(Gf.Quatd(math.cos(h), 0, 0, math.sin(h)))
+        m["o"].set(Gf.Quatd(math.cos(h), 0, 0, math.sin(h)))
 
     for m in mags:
         _set_mag_pose(m, *m["pose"])
 
     # the magazine's origin may not be its centre: shift so the CENTRE is under the claws
-    if mags and CENTER_UNDER_CLAWS:
-        r_m = _bbox(stage.GetPrimAtPath(MAGAZINES_PATH + "/MAG_01"))
+    if mags and CENTER_UNDER_CLAWS and not kept_slots:
+        r_m = _bbox(mags[0]["prim"])
         if r_m is not None:
             mx0, my0, _, myaw0 = mags[0]["pose"]
             cx, cy = (r_m.GetMin()[0] + r_m.GetMax()[0]) / 2, (r_m.GetMin()[1] + r_m.GetMax()[1]) / 2
@@ -707,10 +808,20 @@ def _run_in_omniverse():
                 x, y, z, yaw = pose
                 return (x - (math.cos(yaw) * loc[0] - math.sin(yaw) * loc[1]),
                         y - (math.sin(yaw) * loc[0] + math.cos(yaw) * loc[1]), z, yaw)
-            slots = [_shift(sl) for sl in slots]
+            slots = [sl if k in kept_slots else _shift(sl) for k, sl in enumerate(slots)]
             for m in mags:
                 m["pose"] = _shift(m["pose"])
                 _set_mag_pose(m, *m["pose"])
+
+    # pick geometry, measured once: claw tips relative to the OHT origin, and the
+    # magazine top relative to the magazine origin (no bbox work while running)
+    claw_rel_z = mag_top_rel = None
+    if r_h is not None:
+        claw_rel_z = r_h.GetMin()[2] - prims[0][0].Get()[2]
+    if mags:
+        r_m1 = _bbox(mags[0]["prim"])
+        if r_m1 is not None:
+            mag_top_rel = r_m1.GetMax()[2] - mags[0]["pose"][2]
 
     def _vdrop(v):
         return v.drop if v.drop is not None else drop_m
@@ -733,14 +844,12 @@ def _run_in_omniverse():
             # lower exactly until the carried magazine is back at machine height
             # start is retracted (+carry_raise); end must put the magazine at machine height
             v.drop = max(0.05, mags[v.mag]["pose"][2] - slots[k][2] - carry_raise)
-        elif action == "pick" and machine_mag_of(k) is not None:
-            hu = stage.GetPrimAtPath("%s/OHT_%02d/Hoist_Unit" % (FLEET_PATH, v.idx + 1))
-            mag_prim = stage.GetPrimAtPath("%s/MAG_%02d" % (MAGAZINES_PATH, machine_mag_of(k) + 1))
-            r_h, r_m = _bbox(hu), _bbox(mag_prim)
-            if r_h is not None and r_m is not None:
-                d = r_h.GetMin()[2] - (r_m.GetMax()[2] - GRIP_DEPTH_M)
-                if 0.1 < d < 10:
-                    v.drop = d
+        elif action == "pick" and machine_mag_of(k) is not None and \
+                claw_rel_z is not None and mag_top_rel is not None:
+            mz = mags[machine_mag_of(k)]["pose"][2]
+            d = (oht_z + claw_rel_z) - (mz + mag_top_rel - GRIP_DEPTH_M)
+            if 0.1 < d < 10:
+                v.drop = d
         if LOG_JOBS and action:
             print("[OHT Fleet] OHT_%02d lowering %.2f m to %s" % (v.idx + 1, v.drop, action))
 
@@ -758,8 +867,8 @@ def _run_in_omniverse():
         else:
             m["attach"] = None    # released: it stays where it was set down
         if LOG_JOBS:
-            print("[OHT Fleet] OHT_%02d %s MAG_%02d at %s"
-                  % (v.idx + 1, "picked up" if kind == "pick" else "dropped off", mag_id + 1, station_names[k]))
+            print("[OHT Fleet] OHT_%02d %s %s at %s"
+                  % (v.idx + 1, "picked up" if kind == "pick" else "dropped off", m["prim"].GetName(), station_names[k]))
 
     drop_local = drop_m / hoist_scale
 
@@ -771,10 +880,14 @@ def _run_in_omniverse():
 
     # ---- hoist cables: attach points in the OHT's own frame
     cable_pts_local = None          # list of (dx, dy, dz_top) in model frame
+    anchors = tmpl.GetCustomDataByKey("ohtCableAnchors")
+    if anchors:                     # the generated vehicle tells us where its belts are
+        cable_pts_local = [(a[0], a[1], a[2]) for a in anchors]
     ct = stage.GetPrimAtPath(CABLE_TEMPLATE)
     t_pos = tmpl.GetAttribute("xformOp:translate:oht").Get()
     t_ori = tmpl.GetAttribute("xformOp:orient:oht").Get()
-    if ct.IsValid() and ct.GetAttribute("points").Get() and t_pos is not None and t_ori is not None:
+    if cable_pts_local is None and ct.IsValid() and ct.GetAttribute("points").Get() \
+            and t_pos is not None and t_ori is not None:
         pts = ct.GetAttribute("points").Get()
         th = -_qyaw(t_ori)
         c_, s2 = math.cos(th), math.sin(th)
@@ -787,44 +900,51 @@ def _run_in_omniverse():
         cable_pts_local = [(sx * 0.1, sy * 0.05, -0.096) for sx in (-1, 1) for sy in (-1, 1)]
     # Each cable is a thin cylinder (renders reliably in RTX, unlike curves):
     # 1 m tall, stretched with its Z scale to the current hoist depth.
-    cable_ops = []                 # per OHT: list of (translate op, scale op)
+    cable_ops = []                 # per OHT: (visibility writer, [(translate, scale) writers])
     if SHOW_CABLES:
         UsdGeom.Scope.Define(stage, FLEET_PATH + "/Hoist_Cables")
         for i in range(NUM_OHT):
+            grp = UsdGeom.Xform.Define(stage, "%s/Hoist_Cables/OHT_%02d" % (FLEET_PATH, i + 1))
             ops = []
             for j in range(len(cable_pts_local)):
-                cyl = UsdGeom.Cylinder.Define(stage, "%s/Hoist_Cables/OHT_%02d_%d" % (FLEET_PATH, i + 1, j))
+                cyl = UsdGeom.Cylinder.Define(stage, "%s/Hoist_Cables/OHT_%02d/c%d" % (FLEET_PATH, i + 1, j))
                 cyl.CreateRadiusAttr(CABLE_WIDTH_M / 2)
                 cyl.CreateHeightAttr(1.0)
                 cyl.CreateAxisAttr(UsdGeom.Tokens.z)
                 cyl.CreateDisplayColorAttr([Gf.Vec3f(*CABLE_COLOR)])
-                ops.append((cyl.AddTranslateOp(), cyl.AddScaleOp()))
-            cable_ops.append(ops)
+                ops.append((_W(cyl.AddTranslateOp().GetAttr()), _W(cyl.AddScaleOp().GetAttr())))
+            cable_ops.append((_W(grp.CreateVisibilityAttr()), ops))
 
     def _update_cables():
-        for v, ops in zip(sim.veh, cable_ops):
+        for v, (vis, ops) in zip(sim.veh, cable_ops):
+            length = -_lift(v) + 0.002
+            if length < 0.005:                     # hoist up: nothing to show or update
+                vis.set(UsdGeom.Tokens.invisible)
+                continue
+            vis.set(UsdGeom.Tokens.inherited)
             x, y, yaw = path.pose(v.s)
             th = yaw + yaw_off + base_yaw          # model yaw of this OHT
             c_, s2 = math.cos(th), math.sin(th)
-            length = max(1e-4, -_lift(v) + 0.002)
             for (dx, dy, dz), (t_op, s_op) in zip(cable_pts_local, ops):
                 top = oht_z + dz
-                t_op.Set(Gf.Vec3d(x + c_ * dx - s2 * dy, y + s2 * dx + c_ * dy, top - length / 2))
-                s_op.Set(Gf.Vec3f(1, 1, length))
+                t_op.set(Gf.Vec3d(x + c_ * dx - s2 * dy, y + s2 * dx + c_ * dy, top - length / 2))
+                s_op.set(Gf.Vec3f(1, 1, length))
+
+    writers = [(_W(t_a), _W(o_a), _W(h_a) if h_a else None, claws) for t_a, o_a, h_a, _, claws in prims]
 
     def write_poses():
         with Sdf.ChangeBlock():
-            for v, (t_a, o_a, h_a, _, claws) in zip(sim.veh, prims):
+            for v, (t_a, o_a, h_a, claws) in zip(sim.veh, writers):
                 x, y, yaw = path.pose(v.s)
-                t_a.Set(Gf.Vec3d(x, y, oht_z))
+                t_a.set(Gf.Vec3d(x, y, oht_z))
                 half = (yaw + yaw_off) / 2
                 q = Gf.Quatd(math.cos(half), 0, 0, math.sin(half)) * base_q
-                o_a.Set(q)
+                o_a.set(q)
                 if h_a:
-                    h_a.Set(Gf.Vec3d(0, 0, _lift(v) / hoist_scale))
+                    h_a.set(Gf.Vec3d(0, 0, _lift(v) / hoist_scale))
                 for c_attr, rest in claws:      # move each claw toward the centre
                     inward = -1.0 if rest[0] > 0 else 1.0
-                    c_attr.Set(Gf.Vec3d(rest[0] + inward * CLAW_CLOSE_M * v.claw, rest[1], rest[2]))
+                    c_attr.set(Gf.Vec3d(rest[0] + inward * v.claw, rest[1], rest[2]))
                 if v.mag is not None and v.mag < len(mags) and mags[v.mag]["attach"]:
                     m = mags[v.mag]
                     ax, ay, az, ayaw = m["attach"]
@@ -844,8 +964,18 @@ def _run_in_omniverse():
             if p.HasAPI(UsdPhysics.RigidBodyAPI):
                 UsdPhysics.RigidBodyAPI(p).CreateKinematicEnabledAttr(True)
                 n_kin += 1
+    if KINEMATIC_COLLIDERS:
+        roots = [pr for _, _, _, pr, _ in prims] + [m["prim"] for m in mags]
+        for root in roots:
+            has_col = has_rb = False
+            for p in Usd.PrimRange(root, Usd.TraverseInstanceProxies()):
+                has_col = has_col or p.HasAPI(UsdPhysics.CollisionAPI)
+                has_rb = has_rb or p.HasAPI(UsdPhysics.RigidBodyAPI)
+            if has_col and not has_rb:
+                UsdPhysics.RigidBodyAPI.Apply(root).CreateKinematicEnabledAttr(True)
+                n_kin += 1
     if n_kin:
-        print("[OHT Fleet] set %d rigid bodies to kinematic" % n_kin)
+        print("[OHT Fleet] %d moving objects set to kinematic physics bodies" % n_kin)
 
     import time
     import traceback
@@ -874,9 +1004,12 @@ def _run_in_omniverse():
             if RUN_ONLY_WHEN_PLAYING and not timeline.is_playing():
                 return
             try:
+                t0 = time.perf_counter()
                 self.sim.step(dt)
                 write_poses()
                 self.frames += 1
+                if PROFILE_EVERY_S:
+                    self._prof(dt, time.perf_counter() - t0)
                 if self.frames == 30:
                     v = self.sim.veh[0]
                     print("[OHT Fleet] running — OHT_01 speed %.2f m/s, state %s" % (v.v, v.state))
@@ -884,6 +1017,23 @@ def _run_in_omniverse():
                 self.errors += 1
                 if self.errors <= 3:
                     print("[OHT Fleet] ERROR in update:\n" + traceback.format_exc())
+
+        def _prof(self, dt, used):
+            p = getattr(self, "_p", None)
+            if p is None:
+                p = self._p = {"t": 0.0, "n": 0, "used": 0.0, "max": 0.0, "fmax": 0.0}
+            p["t"] += dt; p["n"] += 1; p["used"] += used
+            p["max"] = max(p["max"], used); p["fmax"] = max(p["fmax"], dt)
+            if p["t"] >= PROFILE_EVERY_S:
+                frame = p["t"] / p["n"] * 1000
+                script = p["used"] / p["n"] * 1000
+                share = 100 * script / frame if frame else 0
+                print("[OHT Fleet] %.0f FPS | frame %.1f ms (worst %.0f) | this script %.2f ms (worst %.1f) = %.0f%% of the frame | %s"
+                      % (1000 / frame if frame else 0, frame, p["fmax"] * 1000, script, p["max"] * 1000, share,
+                         "playing" if timeline.is_playing() else "not playing"))
+                if share < 10:
+                    print("[OHT Fleet]   -> the script is not the bottleneck; the time is spent in Isaac Sim (rendering/physics)")
+                self._p = None
 
         def stop(self):
             if self.sub:
