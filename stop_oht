@@ -1,0 +1,9 @@
+#stop animation
+import builtins
+
+fleet = getattr(builtins, "_oht_fleet", None)
+if fleet is not None:
+    fleet.stop()
+    print("OHT fleet stopped.")
+else:
+    print("No OHT fleet controller is running.")
