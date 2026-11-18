@@ -95,7 +95,6 @@ MAGAZINES_PATH    = "/World/Magazines"
 NUM_MAGAZINES     = None       # None = half of the machines
 HIDE_ORIGINAL_MAGAZINE = True  # hide /World/full (the copies replace it)
 CLAW_CLOSE_M      = 0.05       # how far each claw moves inward when gripping
-CARRY_RAISE_M = 0.15
 
 LOG_JOBS      = True           # print pick/drop events in the console
 HOIST_DROP_M  = 2.75           # only a fallback now: on every pick the hoist
@@ -104,6 +103,12 @@ HOIST_DROP_M  = 2.75           # only a fallback now: on every pick the hoist
                                # exactly onto the machine.
 GRIP_DEPTH_M  = 0.05           # how far the claw tips go below the magazine top
 CENTER_UNDER_CLAWS = True      # place magazines exactly under the claws
+CARRY_RAISE_M = None           # when carrying, the whole hoist (gripper + claws
+                               # + magazine) retracts this far ABOVE its rest
+                               # position, pulling the magazine up into the OHT.
+                               # None = auto: measured so the magazine's bottom
+                               # ends level with the bottom of the OHT body.
+CARRY_RAISE_FALLBACK_M = 0.15  # used if auto can't measure
 HOIST_TIME_S  = 3.4            # lowering time (same for raising)
 GRIP_TIME_S   = 3.0
 
@@ -120,7 +125,7 @@ CABLE_WIDTH_M    = 0.012
 CABLE_COLOR      = (0.1, 0.1, 0.1)
 
 # Performance
-MAGAZINE_INSTANCEABLE = False  # draw magazine copies as instances: moving a
+MAGAZINE_INSTANCEABLE = True   # draw magazine copies as instances: moving a
                                # magazine updates 1 transform instead of every
                                # mesh inside it (this was the lag on pick/drop)
 MAX_SUBSTEP_S = 0.02           # simulation substep; slow frames are caught up
@@ -517,6 +522,31 @@ def _run_in_omniverse():
         claw_off = (math.cos(th) * dx - math.sin(th) * dy, math.sin(th) * dx + math.cos(th) * dy)
         print("[OHT Fleet] claws are %.3f m / %.3f m from the OHT origin" % claw_off)
 
+    # how far the hoist must retract so a gripped magazine sits inside the OHT body
+    carry_raise = CARRY_RAISE_M
+    if carry_raise is None:
+        carry_raise = CARRY_RAISE_FALLBACK_M
+        try:
+            oht0 = prims[0][3]
+            body_min = None
+            for ch in oht0.GetChildren():                  # everything except the hoist
+                if ch.GetName() in ("Hoist_Unit",):
+                    continue
+                r = _bbox(ch)
+                if r is not None:
+                    body_min = r.GetMin()[2] if body_min is None else min(body_min, r.GetMin()[2])
+            r_mag = _bbox(stage.GetPrimAtPath(MAGAZINE_TEMPLATE))
+            if body_min is not None and r_h is not None and r_mag is not None:
+                mag_h = r_mag.GetMax()[2] - r_mag.GetMin()[2]
+                mag_bottom_at_rest = r_h.GetMin()[2] + GRIP_DEPTH_M - mag_h
+                carry_raise = max(0.0, min(2.0, body_min - mag_bottom_at_rest))
+                print("[OHT Fleet] carry raise measured: %.2f m (magazine %.2f m tall goes into the OHT)"
+                      % (carry_raise, mag_h))
+            else:
+                print("[OHT Fleet] could not measure OHT body / magazine — carry raise %.2f m" % carry_raise)
+        except Exception as ex:
+            print("[OHT Fleet] carry raise measure failed (%s) — using %.2f m" % (ex, carry_raise))
+
     # hoist: convert world metres to the model's local units
     # (the template uses xformOp:scale:oht = 0.01, so 1 m = 100 local units)
     hoist_scale = 1.0
@@ -685,16 +715,24 @@ def _run_in_omniverse():
     def _vdrop(v):
         return v.drop if v.drop is not None else drop_m
 
+    def _lift(v):
+        """gripper height relative to its rest position (m, + = up).
+        Lowered: -drop. Up and carrying: +carry_raise (retracted into the OHT).
+        Gripper, claws, cables and magazine all use this one value."""
+        carrying = v.mag is not None and v.mag < len(mags) and mags[v.mag]["attach"] is not None
+        return -_vdrop(v) * v.hoist + (carry_raise if carrying else 0.0) * (1.0 - v.hoist)
+
     def _gripper(v):
         x, y, yaw = path.pose(v.s)
-        return x, y, oht_z - _vdrop(v) * v.hoist, yaw
+        return x, y, oht_z + _lift(v), yaw
 
     def on_arrive(v, k, action):
         """Decide how far to lower for this job, from the real geometry."""
         v.drop = drop_m
         if action == "drop" and v.mag is not None and v.mag < len(mags):
             # lower exactly until the carried magazine is back at machine height
-            v.drop = max(0.05, mags[v.mag]["pose"][2] - slots[k][2])
+            # start is retracted (+carry_raise); end must put the magazine at machine height
+            v.drop = max(0.05, mags[v.mag]["pose"][2] - slots[k][2] - carry_raise)
         elif action == "pick" and machine_mag_of(k) is not None:
             hu = stage.GetPrimAtPath("%s/OHT_%02d/Hoist_Unit" % (FLEET_PATH, v.idx + 1))
             mag_prim = stage.GetPrimAtPath("%s/MAG_%02d" % (MAGAZINES_PATH, machine_mag_of(k) + 1))
@@ -768,7 +806,7 @@ def _run_in_omniverse():
             x, y, yaw = path.pose(v.s)
             th = yaw + yaw_off + base_yaw          # model yaw of this OHT
             c_, s2 = math.cos(th), math.sin(th)
-            length = max(1e-4, _vdrop(v) * v.hoist + 0.002)
+            length = max(1e-4, -_lift(v) + 0.002)
             for (dx, dy, dz), (t_op, s_op) in zip(cable_pts_local, ops):
                 top = oht_z + dz
                 t_op.Set(Gf.Vec3d(x + c_ * dx - s2 * dy, y + s2 * dx + c_ * dy, top - length / 2))
@@ -783,7 +821,7 @@ def _run_in_omniverse():
                 q = Gf.Quatd(math.cos(half), 0, 0, math.sin(half)) * base_q
                 o_a.Set(q)
                 if h_a:
-                    h_a.Set(Gf.Vec3d(0, 0, -_vdrop(v) / hoist_scale * v.hoist))
+                    h_a.Set(Gf.Vec3d(0, 0, _lift(v) / hoist_scale))
                 for c_attr, rest in claws:      # move each claw toward the centre
                     inward = -1.0 if rest[0] > 0 else 1.0
                     c_attr.Set(Gf.Vec3d(rest[0] + inward * CLAW_CLOSE_M * v.claw, rest[1], rest[2]))
@@ -792,14 +830,7 @@ def _run_in_omniverse():
                     ax, ay, az, ayaw = m["attach"]
                     gx, gy, gz, gyaw = _gripper(v)
                     c, s_ = math.cos(gyaw), math.sin(gyaw)
-
-                    # Keep the magazine attached to the gripper
-                    m["pose"] = (
-                        gx + c * ax - s_ * ay,
-                        gy + s_ * ax + c * ay,
-                        gz + az,
-                        gyaw + ayaw
-                    )
+                    m["pose"] = (gx + c * ax - s_ * ay, gy + s_ * ax + c * ay, gz + az, gyaw + ayaw)
                     _set_mag_pose(m, *m["pose"])
             _update_cables()
 
