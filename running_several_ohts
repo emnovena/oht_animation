@@ -103,7 +103,7 @@ MAGAZINE_TEMPLATE = "/World/full"
 MAGAZINES_PATH    = "/World/Magazines"
 NUM_MAGAZINES     = None       # None = half of the machines
 HIDE_ORIGINAL_MAGAZINE = True  # hide /World/full (the copies replace it)
-CLAW_CLOSE_M      = 0.05       # how far each claw moves INWARD to grip the magazine
+CLAW_CLOSE_M      = 0.02       # how far each claw moves INWARD to grip the magazine
 CLAW_OPEN_M       = 0.04       # how far each claw opens OUTWARD before gripping and
                                # when releasing (then it closes back to rest)
 
