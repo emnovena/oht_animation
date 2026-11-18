@@ -31,8 +31,8 @@ import builtins
 # ---------------------------------------------------------------------------
 # SETTINGS
 # ---------------------------------------------------------------------------
-TEMPLATE_PATH = "/World/OHT_Vehicle"       # OHT model to copy (made by build_oht_vehicle.py)
-OLD_TEMPLATE_PATH = "/World/OHT2grip_Revised"   # used if the new vehicle isn't built yet
+TEMPLATE_PATH = "/World/OHT2grip_Revised"  # your OHT model (or "/World/OHT_Vehicle" from build_oht_vehicle.py)
+OLD_TEMPLATE_PATH = "/World/OHT_Vehicle"   # used if TEMPLATE_PATH doesn't exist
 FLEET_PATH    = "/World/OHT_Fleet"
 NUM_OHT       = 4            # 3+ vehicles; capacity check is done on start
 HIDE_TEMPLATE = True
@@ -130,7 +130,28 @@ OHT_Z_OFFSET_M = 0.0         # raise(+)/lower(-) all OHTs. If they sit ON TOP of
 SHOW_ROUTE    = True
 
 # Hoist cables ("strings") between each OHT and its hoist
-SHOW_CABLES      = True
+# The OHT model's OWN hoists. Your OHT2grip_Revised has built-in hoists in the
+# model, plus an extra "Hoist_Unit" (a plate and two claws made of cubes) that an
+# old script added. Moving that extra one looks like a 3rd hoist from nowhere.
+USE_BUILTIN_HOIST   = True     # move the model's real hoists and hide the extra Hoist_Unit
+# Your model has two hoists (CLIP_1, CLIP_2) under MOVING_PART. Only ONE of them
+# goes down to pick up / drop off the magazine; the other one stays up.
+HOIST_CLIPS_PARENT  = "OHT2grip_01/MOVING_PART"     # where CLIP_1 / CLIP_2 are, inside the OHT
+HOIST_CLIP          = "auto"   # "CLIP_1", "CLIP_2", or "auto" = the clip that holds the
+                               # model's own magazine (MAGAZINE_1)
+MODEL_MAGAZINE      = "OHT2grip_01/MAGAZINE_1"
+BUILTIN_HOIST_PARTS = []       # advanced: other part paths to move instead (overrides the above)
+BUILTIN_HOIST_HINTS = ("moving_part", "hoist", "gripper", "grip", "hand", "lift")
+HIDE_MODEL_PARTS    = ["OHT2grip_01/MAGAZINE_1"]   # the magazine built into your OHT model:
+                               # the script's magazines are picked up instead, so
+                               # this one would otherwise ride along all the time
+BUILTIN_CLAW_HINTS  = ("clip", "claw", "finger")   # gripper fingers inside it (e.g. CLIP_1,
+                               # CLIP_2): they open outward and close inward to grip
+MODEL_CABLES     = True        # use the cables/belts that are part of your OHT model:
+                               # they are stretched down with the hoist automatically
+CABLE_NAME_HINTS = ("cable", "belt", "wire", "rope", "strap")   # how they are found (by name)
+SHOW_CABLES      = "auto"      # cables on top of the gripper: "auto" = draw them only if the
+                               # model's own belts weren't found, True = always draw, False = never
 CABLE_TEMPLATE   = "/World/OHT_Hoist_Cables"   # your original cables, used for attach points
 CABLE_WIDTH_M    = 0.012
 CABLE_COLOR      = (0.1, 0.1, 0.1)
@@ -560,13 +581,142 @@ def _run_in_omniverse():
         except Exception:
             return None
 
+    # ---- the model's own (built-in) hoists
+    # Each part gets one extra translate op, expressed in its own local space,
+    # that moves it straight down in world space by the hoist depth.
+    builtin = []                    # per OHT: list of (writer, local vector for +1 m world Z)
+    builtin_claws = []              # per OHT: list of (writer, local vector for 1 m outward, path)
+    builtin_paths = []              # the hoist parts (cables under them are fixed at the bottom)
+    clip_info = []                  # per OHT: (centre of the clip that moves, centres of the others)
+    held_ref = [None, None]         # (box of the model's own magazine, box of the moving clip) on OHT_01
+    builtin_box = None
+    if USE_BUILTIN_HOIST:
+        names, claw_names = set(), set()
+        for _, _, _, prim, _ in prims:
+            mine, skip, my_claws = [], None, []
+            addon = prim.GetPath().AppendChild("Hoist_Unit")
+            cands = []
+            # ---- pick ONE clip: the one that goes down
+            other_centers, chosen_center = [], None
+            parent = stage.GetPrimAtPath(prim.GetPath().AppendPath(Sdf.Path(HOIST_CLIPS_PARENT)))
+            if not BUILTIN_HOIST_PARTS and parent and parent.IsValid():
+                clips = sorted([c for c in parent.GetChildren() if "clip" in c.GetName().lower()],
+                               key=lambda c: c.GetName())
+                centers = {c.GetName(): (_bbox(c).GetMidpoint() if _bbox(c) is not None else None) for c in clips}
+                chosen = None
+                if clips and HOIST_CLIP != "auto":
+                    chosen = next((c for c in clips if c.GetName() == HOIST_CLIP), None)
+                if clips and chosen is None:
+                    mag = stage.GetPrimAtPath(prim.GetPath().AppendPath(Sdf.Path(MODEL_MAGAZINE)))
+                    rm = _bbox(mag) if mag and mag.IsValid() else None
+                    with_c = [c for c in clips if centers[c.GetName()] is not None]
+                    if rm is not None and with_c:
+                        mc = rm.GetMidpoint()
+                        chosen = min(with_c, key=lambda c: math.hypot(centers[c.GetName()][0] - mc[0],
+                                                                       centers[c.GetName()][1] - mc[1]))
+                    else:
+                        chosen = clips[0]
+                if chosen is not None and prim is prims[0][3]:
+                    mag_ref = stage.GetPrimAtPath(prim.GetPath().AppendPath(Sdf.Path(MODEL_MAGAZINE)))
+                    held_ref[0] = _bbox(mag_ref) if mag_ref and mag_ref.IsValid() else None
+                    held_ref[1] = _bbox(chosen)
+                if chosen is not None:
+                    cands = [chosen]
+                    chosen_center = centers[chosen.GetName()]
+                    other_centers = [centers[c.GetName()] for c in clips
+                                     if c is not chosen and centers[c.GetName()] is not None]
+            clip_info.append((chosen_center, other_centers))
+            if not cands and BUILTIN_HOIST_PARTS:
+                cands = [stage.GetPrimAtPath(prim.GetPath().AppendPath(Sdf.Path(rel)))
+                         for rel in BUILTIN_HOIST_PARTS]
+                cands = [c for c in cands if c and c.IsValid()]
+                if not cands and prim is prims[0][3]:
+                    print("[OHT Fleet] BUILTIN_HOIST_PARTS %s not found in the OHT — searching by name"
+                          % BUILTIN_HOIST_PARTS)
+            if not cands:
+                cands = [p for p in Usd.PrimRange(prim)
+                         if not p.GetPath().HasPrefix(addon)
+                         and any(h in p.GetName().lower() for h in BUILTIN_HOIST_HINTS)
+                         and not any(h in p.GetName().lower() for h in CABLE_NAME_HINTS)]
+            for p in cands:
+                if not p or not p.IsValid() or (skip and any(p.GetPath().HasPrefix(s) for s in skip)):
+                    continue
+                skip = (skip or []) + [p.GetPath()]          # whole part, not its children too
+                xf = UsdGeom.Xformable(p)
+                inv = xf.ComputeLocalToWorldTransform(Usd.TimeCode.Default()).GetInverse()
+                op = xf.AddTranslateOp(UsdGeom.XformOp.PrecisionDouble, "builtinHoist")
+                mine.append((_W(op.GetAttr()), inv.TransformDir(Gf.Vec3d(0, 0, 1))))
+                names.add(p.GetName())
+                builtin_paths.append(p.GetPath())
+                # fingers inside this hoist part (CLIP_1, CLIP_2 ...): they open away from
+                # and close toward the point between them
+                fingers, taken = [], []
+                for q in Usd.PrimRange(p):
+                    if q == p or not any(h in q.GetName().lower() for h in BUILTIN_CLAW_HINTS):
+                        continue
+                    if any(q.GetPath().HasPrefix(t) for t in taken):
+                        continue                      # a finger's own sub-parts
+                    taken.append(q.GetPath())
+                    r_q = _bbox(q)
+                    if r_q is not None:
+                        fingers.append((q, r_q.GetMidpoint()))
+                if len(fingers) < 2:          # e.g. CLIP_1/CLIP holds the two finger parts
+                    for q in Usd.PrimRange(p):
+                        kids = [k for k in q.GetChildren() if _bbox(k) is not None]
+                        if q != p and len(kids) >= 2 and any(h in q.GetName().lower() for h in BUILTIN_CLAW_HINTS):
+                            fingers = [(k, _bbox(k).GetMidpoint()) for k in kids]
+                            break
+                if len(fingers) >= 2:
+                    mid = sum((f[1] for f in fingers), Gf.Vec3d(0, 0, 0)) / len(fingers)
+                    for q, cq in fingers:
+                        dv = Gf.Vec3d(cq[0] - mid[0], cq[1] - mid[1], 0.0)
+                        if dv.GetLength() < 1e-3:
+                            continue
+                        qx = UsdGeom.Xformable(q)
+                        q_inv = qx.ComputeLocalToWorldTransform(Usd.TimeCode.Default()).GetInverse()
+                        c_op = qx.AddTranslateOp(UsdGeom.XformOp.PrecisionDouble, "builtinClaw")
+                        my_claws.append((_W(c_op.GetAttr()), q_inv.TransformDir(dv.GetNormalized()), q.GetPath()))
+                        claw_names.add(q.GetName())
+                if prim is prims[0][3]:
+                    r = _bbox(p)
+                    if r is not None:
+                        builtin_box = r if builtin_box is None else Gf.Range3d(
+                            Gf.Vec3d(*[min(builtin_box.GetMin()[i], r.GetMin()[i]) for i in range(3)]),
+                            Gf.Vec3d(*[max(builtin_box.GetMax()[i], r.GetMax()[i]) for i in range(3)]))
+            builtin.append(mine)
+            builtin_claws.append(my_claws)
+        if any(builtin):
+            print("[OHT Fleet] hoist that goes down: %s, its fingers: %s (the other clip stays up, the extra Hoist_Unit is hidden)"
+                  % (", ".join(sorted(names)), ", ".join(sorted(claw_names)) or "none found"))
+            for _, _, _, prim, _ in prims:
+                hu = stage.GetPrimAtPath(prim.GetPath().AppendChild("Hoist_Unit"))
+                if hu.IsValid():
+                    UsdGeom.Imageable(hu).MakeInvisible()
+                for rel in HIDE_MODEL_PARTS:
+                    hp = stage.GetPrimAtPath(prim.GetPath().AppendPath(Sdf.Path(rel)))
+                    if hp and hp.IsValid():
+                        UsdGeom.Imageable(hp).MakeInvisible()
+        else:
+            builtin, builtin_claws = [], []
+            print("[OHT Fleet] no built-in hoist found by name (%s) — still using Hoist_Unit. "
+                  "Run inspect_oht.py and put the hoist part names in BUILTIN_HOIST_PARTS."
+                  % ", ".join(BUILTIN_HOIST_HINTS))
+
     # where the claws are relative to the OHT origin, in the OHT's travel frame
     claw_off = (0.0, 0.0)
     hu0 = stage.GetPrimAtPath(FLEET_PATH + "/OHT_01/Hoist_Unit")
-    r_h = _bbox(hu0) if hu0.IsValid() else None
-    if r_h is not None and CENTER_UNDER_CLAWS:
+    r_h = builtin_box if builtin_box is not None else (_bbox(hu0) if hu0.IsValid() else None)
+    # a magazine held by the clip sits where the model's own MAGAZINE_1 sits: use it
+    # as the target (centre) for every pick and drop
+    held_box = held_ref[0] if builtin else None
+    held_rel_z = None
+    ref_box = held_box if held_box is not None else r_h
+    if held_box is not None:
+        held_rel_z = held_box.GetMidpoint()[2] - prims[0][0].Get()[2]
+        print("[OHT Fleet] held magazine position taken from %s" % MODEL_MAGAZINE)
+    if ref_box is not None and CENTER_UNDER_CLAWS:
         o0 = prims[0][0].Get()
-        cx, cy = (r_h.GetMin()[0] + r_h.GetMax()[0]) / 2, (r_h.GetMin()[1] + r_h.GetMax()[1]) / 2
+        cx, cy = ref_box.GetMidpoint()[0], ref_box.GetMidpoint()[1]
         th = -(_qyaw(prims[0][1].Get()) - base_yaw - yaw_off)
         dx, dy = cx - o0[0], cy - o0[1]
         claw_off = (math.cos(th) * dx - math.sin(th) * dy, math.sin(th) * dx + math.cos(th) * dy)
@@ -574,6 +724,10 @@ def _run_in_omniverse():
 
     # how far the hoist must retract so a gripped magazine sits inside the OHT body
     carry_raise = CARRY_RAISE_M
+    if carry_raise is None and builtin:
+        carry_raise = 0.0           # the model's own hoists: their rest position is the carry position
+    if carry_raise is None and tmpl.GetCustomDataByKey("ohtGenerated"):
+        carry_raise = 0.0           # built by build_oht_vehicle.py: magazine already fits inside
     if carry_raise is None:
         carry_raise = CARRY_RAISE_FALLBACK_M
         try:
@@ -745,12 +899,25 @@ def _run_in_omniverse():
             machine_mag[k] = len(mags) - 1
             slots[k] = (x, y, z, yaw)
             kept_slots.add(k)
-            # the OHT stops so that its claws are exactly above this magazine
-            s0, _ = path.project((x, y))
+            # the OHT stops so that the clip is exactly above this magazine's CENTRE;
+            # small sideways/along errors are corrected by nudging the magazine
+            rb = _bbox(mp)
+            cx, cy = (rb.GetMidpoint()[0], rb.GetMidpoint()[1]) if rb is not None else (x, y)
+            s0, _ = path.project((cx, cy))
             pyaw = path.pose(s0)[2]
-            sx = x - (math.cos(pyaw) * claw_off[0] - math.sin(pyaw) * claw_off[1])
-            sy = y - (math.sin(pyaw) * claw_off[0] + math.cos(pyaw) * claw_off[1])
-            stations_s[k] = path.project((sx, sy))[0]
+            ox_ = math.cos(pyaw) * claw_off[0] - math.sin(pyaw) * claw_off[1]
+            oy_ = math.sin(pyaw) * claw_off[0] + math.cos(pyaw) * claw_off[1]
+            s_k = path.project((cx - ox_, cy - oy_))[0]
+            px_, py_, _ = path.pose(s_k)
+            dx_, dy_ = px_ + ox_ - cx, py_ + oy_ - cy
+            if math.hypot(dx_, dy_) < 0.5:
+                x, y = x + dx_, y + dy_
+                if math.hypot(dx_, dy_) > 0.01:
+                    print("[OHT Fleet] %s nudged %.0f mm to sit exactly under the gripper"
+                          % (mp.GetName(), 1000 * math.hypot(dx_, dy_)))
+            mags[-1]["pose"] = (x, y, z, yaw)
+            slots[k] = (x, y, z, yaw)
+            stations_s[k] = s_k
         if HIDE_ORIGINAL_MAGAZINE and mag_tmpl.IsValid():
             UsdGeom.Imageable(mag_tmpl).MakeInvisible()
         print("[OHT Fleet] keeping your %d magazines where they are: %s"
@@ -815,13 +982,14 @@ def _run_in_omniverse():
 
     # pick geometry, measured once: claw tips relative to the OHT origin, and the
     # magazine top relative to the magazine origin (no bbox work while running)
-    claw_rel_z = mag_top_rel = None
+    claw_rel_z = mag_top_rel = mag_mid_rel = None
     if r_h is not None:
         claw_rel_z = r_h.GetMin()[2] - prims[0][0].Get()[2]
     if mags:
         r_m1 = _bbox(mags[0]["prim"])
         if r_m1 is not None:
             mag_top_rel = r_m1.GetMax()[2] - mags[0]["pose"][2]
+            mag_mid_rel = r_m1.GetMidpoint()[2] - mags[0]["pose"][2]
 
     def _vdrop(v):
         return v.drop if v.drop is not None else drop_m
@@ -844,11 +1012,15 @@ def _run_in_omniverse():
             # lower exactly until the carried magazine is back at machine height
             # start is retracted (+carry_raise); end must put the magazine at machine height
             v.drop = max(0.05, mags[v.mag]["pose"][2] - slots[k][2] - carry_raise)
-        elif action == "pick" and machine_mag_of(k) is not None and \
-                claw_rel_z is not None and mag_top_rel is not None:
+        elif action == "pick" and machine_mag_of(k) is not None:
             mz = mags[machine_mag_of(k)]["pose"][2]
-            d = (oht_z + claw_rel_z) - (mz + mag_top_rel - GRIP_DEPTH_M)
-            if 0.1 < d < 10:
+            d = None
+            if held_rel_z is not None and mag_mid_rel is not None:
+                # lower until the magazine is exactly where the model holds its own one
+                d = (oht_z + held_rel_z) - (mz + mag_mid_rel)
+            elif claw_rel_z is not None and mag_top_rel is not None:
+                d = (oht_z + claw_rel_z) - (mz + mag_top_rel - GRIP_DEPTH_M)
+            if d is not None and 0.1 < d < 10:
                 v.drop = d
         if LOG_JOBS and action:
             print("[OHT Fleet] OHT_%02d lowering %.2f m to %s" % (v.idx + 1, v.drop, action))
@@ -900,8 +1072,21 @@ def _run_in_omniverse():
         cable_pts_local = [(sx * 0.1, sy * 0.05, -0.096) for sx in (-1, 1) for sy in (-1, 1)]
     # Each cable is a thin cylinder (renders reliably in RTX, unlike curves):
     # 1 m tall, stretched with its Z scale to the current hoist depth.
+    if held_ref[1] is not None:      # cables hang from the top of the clip that goes down
+        cb = held_ref[1]
+        o0 = prims[0][0].Get()
+        th = -_qyaw(prims[0][1].Get())
+        c_, s2 = math.cos(th), math.sin(th)
+        mx_, my_ = cb.GetMidpoint()[0], cb.GetMidpoint()[1]
+        hx, hy = cb.GetSize()[0] * 0.3, cb.GetSize()[1] * 0.3
+        cable_pts_local = []
+        for sx_ in (-1, 1):
+            for sy_ in (-1, 1):
+                dx, dy = mx_ + sx_ * hx - o0[0], my_ + sy_ * hy - o0[1]
+                cable_pts_local.append((c_ * dx - s2 * dy, s2 * dx + c_ * dy, cb.GetMax()[2] - o0[2]))
     cable_ops = []                 # per OHT: (visibility writer, [(translate, scale) writers])
-    if SHOW_CABLES:
+
+    def _make_drawn_cables():
         UsdGeom.Scope.Define(stage, FLEET_PATH + "/Hoist_Cables")
         for i in range(NUM_OHT):
             grp = UsdGeom.Xform.Define(stage, "%s/Hoist_Cables/OHT_%02d" % (FLEET_PATH, i + 1))
@@ -914,6 +1099,9 @@ def _run_in_omniverse():
                 cyl.CreateDisplayColorAttr([Gf.Vec3f(*CABLE_COLOR)])
                 ops.append((_W(cyl.AddTranslateOp().GetAttr()), _W(cyl.AddScaleOp().GetAttr())))
             cable_ops.append((_W(grp.CreateVisibilityAttr()), ops))
+
+    if SHOW_CABLES is True:
+        _make_drawn_cables()
 
     def _update_cables():
         for v, (vis, ops) in zip(sim.veh, cable_ops):
@@ -930,6 +1118,70 @@ def _run_in_omniverse():
                 t_op.set(Gf.Vec3d(x + c_ * dx - s2 * dy, y + s2 * dx + c_ * dy, top - length / 2))
                 s_op.set(Gf.Vec3f(1, 1, length))
 
+    # ---- the model's own cables/belts: stretch them with the hoist
+    # Each one keeps its fixed end (top for cables on the vehicle body, bottom
+    # for cables attached to the hoist) and is scaled along world Z to the
+    # current hoist depth, using three extra ops on the cable prim itself.
+    model_cables = []               # per OHT: list of (scale writer, axis index, rest length)
+    if MODEL_CABLES:
+        found_names = set()
+        for i_oht, (_, _, _, prim, _) in enumerate(prims):
+            mine, skip = [], None
+            mc, others = clip_info[i_oht] if i_oht < len(clip_info) else (None, [])
+            groups = []
+            for p in Usd.PrimRange(prim):
+                if skip and p.GetPath().HasPrefix(skip):
+                    continue
+                if any(h in p.GetName().lower() for h in CABLE_NAME_HINTS) and UsdGeom.Xformable(p):
+                    skip = p.GetPath()                      # take the whole cable, not its parts
+                    kids = [k for k in p.GetChildren() if _bbox(k) is not None]
+                    groups += kids if len(kids) >= 2 else [p]   # BELT with 4 belts -> 4 cables
+            for p in groups:
+                if True:
+                    r = _bbox(p)
+                    if r is None or r.GetSize()[2] < 1e-6:
+                        continue
+                    if mc is not None and others:           # only the belts of the clip that moves
+                        bc = r.GetMidpoint()
+                        d_me = math.hypot(bc[0] - mc[0], bc[1] - mc[1])
+                        if any(math.hypot(bc[0] - o[0], bc[1] - o[1]) < d_me for o in others):
+                            continue
+                    on_hoist = "/Hoist_Unit/" in str(p.GetPath()) or \
+                        any(p.GetPath().HasPrefix(b) for b in builtin_paths)
+                    c = r.GetMidpoint()
+                    pivot_w = Gf.Vec3d(c[0], c[1], r.GetMin()[2] if on_hoist else r.GetMax()[2])
+                    inv = UsdGeom.Xformable(p).ComputeLocalToWorldTransform(Usd.TimeCode.Default()).GetInverse()
+                    pivot = inv.Transform(pivot_w)
+                    d = inv.TransformDir(Gf.Vec3d(0, 0, 1))
+                    axis = max(range(3), key=lambda i: abs(d[i]))
+                    xf = UsdGeom.Xformable(p)
+                    xf.AddTranslateOp(UsdGeom.XformOp.PrecisionDouble, "cablePivot").Set(pivot)
+                    s_op = xf.AddScaleOp(UsdGeom.XformOp.PrecisionDouble, "cableStretch")
+                    s_op.Set(Gf.Vec3d(1, 1, 1))
+                    xf.AddTranslateOp(UsdGeom.XformOp.PrecisionDouble, "cablePivotInv").Set(-pivot)
+                    mine.append((_W(s_op.GetAttr()), axis, r.GetSize()[2]))
+                    found_names.add(p.GetName())
+            model_cables.append(mine)
+        n_found = sum(len(m) for m in model_cables)
+        if n_found:
+            print("[OHT Fleet] using %d cables from your OHT model (%s)"
+                  % (n_found // max(1, len(prims)), ", ".join(sorted(found_names))))
+        else:
+            print("[OHT Fleet] no belts found for the moving clip in the OHT model (names with %s)"
+                  % ", ".join(CABLE_NAME_HINTS))
+    if SHOW_CABLES == "auto" and not cable_ops and not any(model_cables):
+        _make_drawn_cables()
+        print("[OHT Fleet] drawing 4 cables on top of the gripper")
+
+    def _update_model_cables():
+        for v, mine in zip(sim.veh, model_cables):
+            lift = _lift(v)
+            for s_w, axis, rest_len in mine:
+                k = max(1e-3, rest_len - lift) / rest_len
+                s = [1.0, 1.0, 1.0]
+                s[axis] = k
+                s_w.set(Gf.Vec3d(*s))
+
     writers = [(_W(t_a), _W(o_a), _W(h_a) if h_a else None, claws) for t_a, o_a, h_a, _, claws in prims]
 
     def write_poses():
@@ -942,6 +1194,12 @@ def _run_in_omniverse():
                 o_a.set(q)
                 if h_a:
                     h_a.set(Gf.Vec3d(0, 0, _lift(v) / hoist_scale))
+                if builtin:
+                    lift = _lift(v)
+                    for w, d in builtin[v.idx]:
+                        w.set(d * lift)
+                    for w, d, _ in builtin_claws[v.idx]:
+                        w.set(d * (-v.claw))         # + claw = closed (inward)
                 for c_attr, rest in claws:      # move each claw toward the centre
                     inward = -1.0 if rest[0] > 0 else 1.0
                     c_attr.set(Gf.Vec3d(rest[0] + inward * v.claw, rest[1], rest[2]))
@@ -953,6 +1211,7 @@ def _run_in_omniverse():
                     m["pose"] = (gx + c * ax - s_ * ay, gy + s_ * ax + c * ay, gz + az, gyaw + ayaw)
                     _set_mag_pose(m, *m["pose"])
             _update_cables()
+            _update_model_cables()
 
     write_poses()
 
