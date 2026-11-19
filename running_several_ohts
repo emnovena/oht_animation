@@ -95,7 +95,10 @@ SKIP_OVERLAPPING_MACHINES = True   # don't place a machine that would overlap an
 # False: rebuild both from NEW_MACHINE_PORTS (your manual moves are lost).
 KEEP_SCENE_LAYOUT = True
 MAG_MATCH_RADIUS_M = 1.0       # a magazine belongs to a machine if it is this close
-
+MAGAZINE_MACHINE_ASSIGNMENT = {
+    "MAG_01": "GM_06",
+    "MAG_04": "GM_05",
+}
 # Magazines (the carriers the OHTs grab). Copies of MAGAZINE_TEMPLATE are put
 # on every other ground machine. An empty OHT is sent to the nearest machine
 # that has a magazine, grabs it, then carries it to the nearest empty machine.
@@ -869,85 +872,170 @@ def _run_in_omniverse():
     kept_slots = set()
     existing = sorted(mag_root.GetChildren(), key=lambda p: p.GetName()) \
         if (KEEP_SCENE_LAYOUT and mag_root.IsValid()) else []
+    existing.sort(key=lambda p: p.GetName() not in MAGAZINE_MACHINE_ASSIGNMENT)
     if existing:
         for mp in existing:
+            name = mp.GetName()
             x, y, z, yaw = _world(mp)
-            free = [k for k in range(len(slots)) if machine_mag[k] is None]
-            if not free:
-                print("[OHT Fleet] %s: no free machine left — not used" % mp.GetName())
-                continue
-            k = min(free, key=lambda k: math.hypot(slots[k][0] - x, slots[k][1] - y))
-            dist = math.hypot(slots[k][0] - x, slots[k][1] - y)
-            if dist > MAG_MATCH_RADIUS_M:
-                print("[OHT Fleet] %s at (%.2f, %.2f) is %.2f m from the nearest machine (%s) — not used. "
-                      "Move it onto a machine, or move a machine under it." % (mp.GetName(), x, y, dist, station_names[k]))
-                continue
-            if abs(z - slots[k][2]) > 0.3:       # was left hanging mid-air: put it on the machine
-                z = slots[k][2]
-            # simple world-space transform: translate + orient (+ scale)
+
+            # Check whether this magazine has a fixed machine assignment
+            forced_machine = MAGAZINE_MACHINE_ASSIGNMENT.get(name)
+
+            if forced_machine:
+                candidates = [
+                    i for i, machine_name in enumerate(station_names)
+                    if machine_name == forced_machine
+                ]
+
+                if not candidates:
+                    print(
+                        "[OHT Fleet] ERROR: assigned machine %s "
+                        "for %s was not found"
+                        % (forced_machine, name)
+                    )
+                    continue
+
+                k = candidates[0]
+
+                if machine_mag[k] is not None:
+                    print(
+                        "[OHT Fleet] ERROR: %s is already assigned "
+                        "a magazine; cannot place %s"
+                        % (forced_machine, name)
+                    )
+                    continue
+
+                # Automatically snap magazine to the machine's
+                # calculated loading position
+                x, y, z, yaw = slots[k]
+
+                print(
+                    "[OHT Fleet] positioning %s on %s"
+                    % (name, forced_machine)
+                )
+
+            else:
+                # Original nearest-machine matching for other magazines
+                free = [
+                    k for k in range(len(slots))
+                    if machine_mag[k] is None
+                ]
+
+                if not free:
+                    print(
+                        "[OHT Fleet] %s: no free machine left"
+                        % name
+                    )
+                    continue
+
+                k = min(
+                    free,
+                    key=lambda k: math.hypot(
+                        slots[k][0] - x,
+                        slots[k][1] - y
+                    )
+                )
+
+                dist = math.hypot(
+                    slots[k][0] - x,
+                    slots[k][1] - y
+                )
+
+                if dist > MAG_MATCH_RADIUS_M:
+                    print(
+                        "[OHT Fleet] %s is %.2f m from %s "
+                        "and was not registered"
+                        % (name, dist, station_names[k])
+                    )
+                    continue
+
+                if abs(z - slots[k][2]) > 0.3:
+                    z = slots[k][2]
+
+            # Set up the magazine's world transform
             if not mp.GetAttribute("xformOp:orient"):
-                mp.CreateAttribute("xformOp:orient", Sdf.ValueTypeNames.Quatd)
-            order = ["xformOp:translate", "xformOp:orient"]
+                mp.CreateAttribute(
+                    "xformOp:orient",
+                    Sdf.ValueTypeNames.Quatd
+                )
+
+            order = [
+                "xformOp:translate",
+                "xformOp:orient"
+            ]
+
             if mp.GetAttribute("xformOp:scale"):
                 order.append("xformOp:scale")
-            mp.GetAttribute("xformOpOrder").Set(Vt.TokenArray(order))
+
+            mp.GetAttribute("xformOpOrder").Set(
+                Vt.TokenArray(order)
+            )
+
+            # IMPORTANT: apply the new position immediately.
+            # This also ensures the following bounding-box check
+            # uses the corrected position.
+            mp.GetAttribute("xformOp:translate").Set(
+                Gf.Vec3d(x, y, z)
+            )
+
+            h = yaw / 2.0
+            o_attr = mp.GetAttribute("xformOp:orient")
+            QuatT = o_attr.GetTypeName().type.pythonClass or Gf.Quatd   # Gf.Quatf or Gf.Quatd
+            o_attr.Set(QuatT(math.cos(h), 0, 0, math.sin(h)))
+
             UsdGeom.Imageable(mp).MakeVisible()
+
             if MAGAZINE_INSTANCEABLE:
                 mp.SetInstanceable(True)
-            mags.append({"t": _W(mp.GetAttribute("xformOp:translate")), "o": _W(mp.GetAttribute("xformOp:orient")),
-                         "pose": (x, y, z, yaw), "attach": None, "prim": mp})
+
+            mags.append({
+                "t": _W(mp.GetAttribute("xformOp:translate")),
+                "o": _W(mp.GetAttribute("xformOp:orient")),
+                "pose": (x, y, z, yaw),
+                "attach": None,
+                "prim": mp
+            })
+
             machine_mag[k] = len(mags) - 1
             slots[k] = (x, y, z, yaw)
             kept_slots.add(k)
-            # the OHT stops so that the clip is exactly above this magazine's CENTRE;
-            # small sideways/along errors are corrected by nudging the magazine
+
+            # Align the machine stop point with the gripper
             rb = _bbox(mp)
-            cx, cy = (rb.GetMidpoint()[0], rb.GetMidpoint()[1]) if rb is not None else (x, y)
+
+            cx, cy = (
+                (rb.GetMidpoint()[0], rb.GetMidpoint()[1])
+                if rb is not None else (x, y)
+            )
+
             s0, _ = path.project((cx, cy))
             pyaw = path.pose(s0)[2]
-            ox_ = math.cos(pyaw) * claw_off[0] - math.sin(pyaw) * claw_off[1]
-            oy_ = math.sin(pyaw) * claw_off[0] + math.cos(pyaw) * claw_off[1]
+
+            ox_ = (
+                math.cos(pyaw) * claw_off[0]
+                - math.sin(pyaw) * claw_off[1]
+            )
+
+            oy_ = (
+                math.sin(pyaw) * claw_off[0]
+                + math.cos(pyaw) * claw_off[1]
+            )
+
             s_k = path.project((cx - ox_, cy - oy_))[0]
+
             px_, py_, _ = path.pose(s_k)
-            dx_, dy_ = px_ + ox_ - cx, py_ + oy_ - cy
+
+            dx_ = px_ + ox_ - cx
+            dy_ = py_ + oy_ - cy
+
             if math.hypot(dx_, dy_) < 0.5:
-                x, y = x + dx_, y + dy_
-                if math.hypot(dx_, dy_) > 0.01:
-                    print("[OHT Fleet] %s nudged %.0f mm to sit exactly under the gripper"
-                          % (mp.GetName(), 1000 * math.hypot(dx_, dy_)))
+                x += dx_
+                y += dy_
+
             mags[-1]["pose"] = (x, y, z, yaw)
             slots[k] = (x, y, z, yaw)
             stations_s[k] = s_k
-        if HIDE_ORIGINAL_MAGAZINE and mag_tmpl.IsValid():
-            UsdGeom.Imageable(mag_tmpl).MakeInvisible()
-        print("[OHT Fleet] keeping your %d magazines where they are: %s"
-              % (len(mags), ", ".join("%s on %s" % (mags[machine_mag[k]]["prim"].GetName(), station_names[k])
-                                      for k in range(len(slots)) if machine_mag[k] is not None)))
-    elif mag_root.IsValid():
-        stage.RemovePrim(mag_root.GetPath())
-    if not existing and mag_tmpl.IsValid() and n_mag > 0:
-        UsdGeom.Xform.Define(stage, MAGAZINES_PATH)
-        mag_layer = next((l for l in stage.GetLayerStack() if l.GetPrimAtPath(MAGAZINE_TEMPLATE)), None)
-        # spread magazines over the machines: 0, 2, 4, ...
-        order = list(range(0, len(stations_s), 2)) + list(range(1, len(stations_s), 2))
-        for m_i in range(n_mag):
-            k = order[m_i]
-            p = "%s/MAG_%02d" % (MAGAZINES_PATH, m_i + 1)
-            Sdf.CopySpec(mag_layer, MAGAZINE_TEMPLATE, dst_layer, p)
-            mp = stage.GetPrimAtPath(p)
-            mp.ClearCustomData()
-            UsdGeom.Imageable(mp).MakeVisible()
-            if MAGAZINE_INSTANCEABLE:
-                mp.SetInstanceable(True)
-            # drop the old carry op, place directly in world space
-            mp.GetAttribute("xformOpOrder").Set(
-                Vt.TokenArray(["xformOp:translate", "xformOp:orient", "xformOp:scale"]))
-            if mp.HasAttribute("xformOp:transform:carry"):
-                mp.RemoveProperty("xformOp:transform:carry")
-            o_attr = mp.GetAttribute("xformOp:orient")
-            mags.append({"t": _W(mp.GetAttribute("xformOp:translate")), "o": _W(o_attr),
-                         "pose": slots[k], "attach": None, "prim": mp})
-            machine_mag[k] = m_i
+
         if HIDE_ORIGINAL_MAGAZINE:
             UsdGeom.Imageable(mag_tmpl).MakeInvisible()
         print("[OHT Fleet] %d magazines placed on: %s"
@@ -958,7 +1046,8 @@ def _run_in_omniverse():
     def _set_mag_pose(m, x, y, z, yaw):
         m["t"].set(Gf.Vec3d(x, y, z))
         h = yaw / 2
-        m["o"].set(Gf.Quatd(math.cos(h), 0, 0, math.sin(h)))
+        QuatT = m["o"].cls or Gf.Quatd
+        m["o"].set(QuatT(math.cos(h), 0, 0, math.sin(h)))
 
     for m in mags:
         _set_mag_pose(m, *m["pose"])
