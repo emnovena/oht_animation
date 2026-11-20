@@ -1,5 +1,5 @@
 """
-OHT Fleet Controller  —  multiple OHTs on one loop, no collisions
+OHT Fleet Controller  —  multiple OHTs on one loop
 =====================================================================
 Run in Omniverse / Isaac Sim:  Window > Script Editor > paste > Run (Ctrl+Enter),
 they start moving right away.  Re-running the script rebuilds the fleet cleanly.
@@ -23,9 +23,6 @@ What it does
     stop, lower the hoist, close the claws, lift the magazine and carry it
     to an empty machine, lower, open the claws, raise, leave.
     Followers queue up behind a working OHT.
-
-IMPORTANT: if another script/extension is still moving OHT2grip_Revised
-(e.g. your original move-and-grab script), stop it first.
 """
 
 import math
@@ -177,7 +174,7 @@ PROFILE_EVERY_S = 5.0          # print FPS and how much time the script uses (0 
 
 
 # ---------------------------------------------------------------------------
-# Route geometry (pure python, no USD needed)
+# Route geometry 
 # ---------------------------------------------------------------------------
 class LoopPath:
     def __init__(self, corners, radius, step=0.02):
@@ -1327,12 +1324,8 @@ def _run_in_omniverse():
                 frame = p["t"] / p["n"] * 1000
                 script = p["used"] / p["n"] * 1000
                 share = 100 * script / frame if frame else 0
-                print("[OHT Fleet] %.0f FPS | frame %.1f ms (worst %.0f) | this script %.2f ms (worst %.1f) = %.0f%% of the frame | %s"
-                      % (1000 / frame if frame else 0, frame, p["fmax"] * 1000, script, p["max"] * 1000, share,
-                         "playing" if timeline.is_playing() else "not playing"))
                 if share < 10:
-                    print("[OHT Fleet]   -> the script is not the bottleneck; the time is spent in Isaac Sim (rendering/physics)")
-                self._p = None
+                    self._p = None
 
         def stop(self):
             if self.sub:
