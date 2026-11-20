@@ -1,4 +1,5 @@
 """
+FOR TESTING
 OHT Fleet Controller  —  multiple OHTs on one loop, no collisions
 =====================================================================
 Run in Omniverse / Isaac Sim:  Window > Script Editor > paste > Run (Ctrl+Enter),
@@ -9,6 +10,9 @@ What it does
   * Clones /World/OHT2grip_Revised into /World/OHT_Fleet/OHT_01..N
     (the original is hidden and used only as a template).
   * Drives every OHT along one closed rail loop (ROUTE_XY below).
+    Corners are true circular arcs (CORNER_RADIUS_M), like the real rail.
+    Each OHT rides on a front and a rear bogie, so in curves the body sits
+    on the chord between them (BOGIE_HALF_SPACING_M).
   * Each OHT measures the gap to the vehicle ahead along the rail and
     - cruises at V_MAX when the way is clear,
     - slows down smoothly as the gap closes (time-headway + braking curve),
@@ -37,25 +41,27 @@ FLEET_PATH    = "/World/OHT_Fleet"
 NUM_OHT       = 4            # 3+ vehicles; capacity check is done on start
 HIDE_TEMPLATE = True
 
-# Closed loop, in travel order (world X, Y in metres). These corner points
-# are taken from the rails in your file: the bay with three lanes at
-# Y = -20.241 / -22.041 / -24.141 between X = 7.698 and 29.398.
+# Closed loop, in travel order (world X, Y in metres): the TRUE (sharp) corners
+# of the rail loop. Each corner is replaced by a circular arc of
+# CORNER_RADIUS_M, exactly like the real curved rail pieces.
+# The bay has three lanes at Y = -20.241 / -22.041 / -24.141
+# between X = 7.698 and 29.398.
 # Route: bottom lane eastbound -> right rail north -> top lane westbound
 #        -> left rail south.  The Magazine_Drop_Target is on the bottom lane.
+# A corner can also be written as (x, y, radius) if one curve differs.
 ROUTE_XY = [
-    (8.498, -24.141),
-    (28.598, -24.141),
-    (29.398, -23.341),
-    (29.398, -21.041),
-    (28.598, -20.241),
-    (8.498, -20.241),
-    (7.698, -21.041),
-    (7.698, -23.341),
+    (7.698, -24.141),
+    (29.398, -24.141),
+    (29.398, -20.241),
+    (7.698, -20.241),
 ]
 # Optional: use a BasisCurves/Points prim you drew instead of ROUTE_XY
 # (its points are read in order as a closed loop). Leave None to use ROUTE_XY.
 ROUTE_PRIM = None
-CORNER_RADIUS_M = 0.6        # rounding of route corners
+CORNER_RADIUS_M = 0.8        # radius of the rail CENTRELINE in the curves
+BOGIE_HALF_SPACING_M = 0.35  # half the distance between the front and rear wheel
+                             # units of the OHT. In curves the body sits on the
+                             # chord between them. 0 = body centre on the rail.
 REVERSE_DIRECTION = False
 
 # Motion (metres, seconds)
@@ -175,17 +181,27 @@ PROFILE_EVERY_S = 5.0          # print FPS and how much time the script uses (0 
 # Route geometry (pure python, no USD needed)
 # ---------------------------------------------------------------------------
 class LoopPath:
-    def __init__(self, corners, radius, step=0.05):
+    def __init__(self, corners, radius, step=0.02):
         pts = self._round_corners(corners, radius)
         pts.append(pts[0])
-        # dense resample
-        self.xy = []
-        for (x0, y0), (x1, y1) in zip(pts[:-1], pts[1:]):
-            seg = math.hypot(x1 - x0, y1 - y0)
-            n = max(1, int(math.ceil(seg / step)))
-            for k in range(n):
-                t = k / n
-                self.xy.append((x0 + (x1 - x0) * t, y0 + (y1 - y0) * t))
+        # resample at an exactly uniform spacing (pose() relies on it)
+        cum = [0.0]
+        for a, b in zip(pts[:-1], pts[1:]):
+            cum.append(cum[-1] + math.hypot(b[0] - a[0], b[1] - a[1]))
+        total = cum[-1]
+        cnt = max(8, int(round(total / step)))
+        d = total / cnt
+        self.xy, j = [], 0
+        for k in range(cnt):
+            s = k * d
+            while cum[j + 1] < s:
+                j += 1
+            seg = cum[j + 1] - cum[j]
+            f = 0.0 if seg < 1e-9 else (s - cum[j]) / seg
+            a, b = pts[j], pts[j + 1]
+            self.xy.append((a[0] + (b[0] - a[0]) * f, a[1] + (b[1] - a[1]) * f))
+
+        # arc length along the loop
         self.s = [0.0]
         for i in range(1, len(self.xy) + 1):
             a, b = self.xy[i - 1], self.xy[i % len(self.xy)]
@@ -193,24 +209,24 @@ class LoopPath:
         self.length = self.s[-1]
         self.n = len(self.xy)
         self.ds = self.length / self.n
-        # heading and curvature-based speed limit per sample
+
+        # heading per sample
         self.yaw = []
         for i in range(self.n):
             a, b = self.xy[i - 1], self.xy[(i + 1) % self.n]
             self.yaw.append(math.atan2(b[1] - a[1], b[0] - a[0]))
-        # curvature averaged over +-0.5 m (the corners are made of short
-        # straight pieces; without averaging the speed limit flickers)
+
+        # curvature averaged over +-0.5 m -> curve speed limit
         w = max(1, int(0.5 / self.ds))
         raw = []
         for i in range(self.n):
-            d = self.yaw[(i + w) % self.n] - self.yaw[i - w]
-            d = (d + math.pi) % (2 * math.pi) - math.pi
-            k = abs(d) / (2 * w * self.ds)
-            raw.append(V_MAX if k < 1e-3 else min(V_MAX, math.sqrt(V_CURVE_LAT_ACC / k)))
-        # take the lowest limit of each corner for the whole corner
-        self.vlim = [min(raw[(i + j) % self.n] for j in range(-w, w + 1)) for i in range(self.n)]
-        # speed profile the OHT can actually follow: brake with B_COMFORT
-        # before a corner, accelerate with A_MAX after it (loop: 2 passes)
+            dyaw = self.yaw[(i + w) % self.n] - self.yaw[i - w]
+            dyaw = (dyaw + math.pi) % (2 * math.pi) - math.pi
+            kappa = abs(dyaw) / (2 * w * self.ds)
+            raw.append(V_MAX if kappa < 1e-3 else min(V_MAX, math.sqrt(V_CURVE_LAT_ACC / kappa)))
+        # lowest limit of each corner for the whole corner
+        self.vlim = [min(raw[(i + jj) % self.n] for jj in range(-w, w + 1)) for i in range(self.n)]
+        # speed profile the OHT can follow: brake before, accelerate after (2 passes)
         for _ in range(2):
             for i in range(self.n - 1, -1, -1):
                 nxt = self.vlim[(i + 1) % self.n]
@@ -221,25 +237,31 @@ class LoopPath:
 
     @staticmethod
     def _round_corners(c, r):
+        """sharp corner points -> true circular arcs (like real rail curves)"""
         out, n = [], len(c)
         for i in range(n):
             p0, p1, p2 = c[i - 1], c[i], c[(i + 1) % n]
+            rr = p1[2] if len(p1) > 2 else r
             v1 = (p1[0] - p0[0], p1[1] - p0[1]); l1 = math.hypot(*v1)
             v2 = (p2[0] - p1[0], p2[1] - p1[1]); l2 = math.hypot(*v2)
             if l1 < 1e-6 or l2 < 1e-6:
                 continue
             u1 = (v1[0] / l1, v1[1] / l1); u2 = (v2[0] / l2, v2[1] / l2)
-            cosang = max(-1.0, min(1.0, u1[0] * u2[0] + u1[1] * u2[1]))
-            theta = math.acos(cosang)
-            if theta < math.radians(3):
-                out.append(p1); continue
-            t = min(r * math.tan(theta / 2), 0.45 * l1, 0.45 * l2)
-            a = (p1[0] - u1[0] * t, p1[1] - u1[1] * t)
-            b = (p1[0] + u2[0] * t, p1[1] + u2[1] * t)
-            for k in range(9):          # quadratic bezier a -> p1 -> b
-                q = k / 8
-                out.append(((1-q)**2*a[0] + 2*(1-q)*q*p1[0] + q*q*b[0],
-                            (1-q)**2*a[1] + 2*(1-q)*q*p1[1] + q*q*b[1]))
+            turn = math.atan2(u1[0] * u2[1] - u1[1] * u2[0], u1[0] * u2[0] + u1[1] * u2[1])
+            if abs(turn) < math.radians(1) or rr <= 0:
+                out.append((p1[0], p1[1])); continue
+            t = rr * math.tan(abs(turn) / 2)
+            lim = 0.5 * min(l1, l2)
+            if t > lim:                                   # segment too short for this radius
+                t = lim; rr = t / math.tan(abs(turn) / 2)
+            a = (p1[0] - u1[0] * t, p1[1] - u1[1] * t)    # where the arc starts
+            side = 1.0 if turn > 0 else -1.0              # left turn -> centre on the left
+            cx, cy = a[0] - side * u1[1] * rr, a[1] + side * u1[0] * rr
+            a0 = math.atan2(a[1] - cy, a[0] - cx)
+            m = max(4, int(abs(turn) / math.radians(2)))
+            for k in range(m + 1):
+                ang = a0 + turn * k / m
+                out.append((cx + rr * math.cos(ang), cy + rr * math.sin(ang)))
         return out
 
     def vlim_at(self, s):
@@ -256,7 +278,8 @@ class LoopPath:
     def index(self, s):
         return int(self.wrap(s) / self.ds) % self.n
 
-    def pose(self, s):
+    def rail_pose(self, s):
+        """point exactly on the rail centreline"""
         s = self.wrap(s)
         i = min(self.n - 1, int(s / self.ds))
         j = (i + 1) % self.n
@@ -264,6 +287,14 @@ class LoopPath:
         x = self.xy[i][0] + (self.xy[j][0] - self.xy[i][0]) * f
         y = self.xy[i][1] + (self.xy[j][1] - self.xy[i][1]) * f
         return x, y, self.yaw[i]
+
+    def pose(self, s):
+        """vehicle pose: front and rear bogie both on the rail, body on the chord"""
+        if BOGIE_HALF_SPACING_M <= 0:
+            return self.rail_pose(s)
+        fx, fy, _ = self.rail_pose(s + BOGIE_HALF_SPACING_M)
+        rx, ry, _ = self.rail_pose(s - BOGIE_HALF_SPACING_M)
+        return (fx + rx) / 2, (fy + ry) / 2, math.atan2(fy - ry, fx - rx)
 
     def project(self, xy):
         best, bi = 1e18, 0
@@ -295,7 +326,7 @@ class Vehicle:
         self.state = "drive"      # drive | lower | grip | raise
         self.timer = 0.0
         self.hoist = 0.0          # 0 = up, 1 = fully lowered
-        self.passes = {}         # station index -> times reached
+        self.passes = {}          # station index -> times reached
         self.target = None        # (machine index, s) or None
         self.target_dist = 0.0
         self.mag = None           # magazine id being carried, or None
@@ -760,7 +791,6 @@ def _run_in_omniverse():
     sc = prims[0][3].GetAttribute("xformOp:scale:oht")
     if sc and sc.Get() is not None and abs(sc.Get()[2]) > 1e-9:
         hoist_scale = abs(sc.Get()[2])
-    drop_local = drop_m / hoist_scale
 
     if SHOW_ROUTE:
         c = UsdGeom.BasisCurves.Define(stage, FLEET_PATH + "/Route_Debug")
@@ -882,109 +912,51 @@ def _run_in_omniverse():
             forced_machine = MAGAZINE_MACHINE_ASSIGNMENT.get(name)
 
             if forced_machine:
-                candidates = [
-                    i for i, machine_name in enumerate(station_names)
-                    if machine_name == forced_machine
-                ]
-
+                candidates = [i for i, machine_name in enumerate(station_names)
+                              if machine_name == forced_machine]
                 if not candidates:
-                    print(
-                        "[OHT Fleet] ERROR: assigned machine %s "
-                        "for %s was not found"
-                        % (forced_machine, name)
-                    )
+                    print("[OHT Fleet] ERROR: assigned machine %s for %s was not found"
+                          % (forced_machine, name))
                     continue
-
                 k = candidates[0]
-
                 if machine_mag[k] is not None:
-                    print(
-                        "[OHT Fleet] ERROR: %s is already assigned "
-                        "a magazine; cannot place %s"
-                        % (forced_machine, name)
-                    )
+                    print("[OHT Fleet] ERROR: %s is already assigned a magazine; cannot place %s"
+                          % (forced_machine, name))
                     continue
-
-                # Automatically snap magazine to the machine's
-                # calculated loading position
+                # snap the magazine to the machine's calculated loading position
                 x, y, z, yaw = slots[k]
-
-                print(
-                    "[OHT Fleet] positioning %s on %s"
-                    % (name, forced_machine)
-                )
-
+                print("[OHT Fleet] positioning %s on %s" % (name, forced_machine))
             else:
-                # Original nearest-machine matching for other magazines
-                free = [
-                    k for k in range(len(slots))
-                    if machine_mag[k] is None
-                ]
-
+                # nearest-machine matching for the other magazines
+                free = [k for k in range(len(slots)) if machine_mag[k] is None]
                 if not free:
-                    print(
-                        "[OHT Fleet] %s: no free machine left"
-                        % name
-                    )
+                    print("[OHT Fleet] %s: no free machine left" % name)
                     continue
-
-                k = min(
-                    free,
-                    key=lambda k: math.hypot(
-                        slots[k][0] - x,
-                        slots[k][1] - y
-                    )
-                )
-
-                dist = math.hypot(
-                    slots[k][0] - x,
-                    slots[k][1] - y
-                )
-
+                k = min(free, key=lambda k: math.hypot(slots[k][0] - x, slots[k][1] - y))
+                dist = math.hypot(slots[k][0] - x, slots[k][1] - y)
                 if dist > MAG_MATCH_RADIUS_M:
-                    print(
-                        "[OHT Fleet] %s is %.2f m from %s "
-                        "and was not registered"
-                        % (name, dist, station_names[k])
-                    )
+                    print("[OHT Fleet] %s is %.2f m from %s and was not registered"
+                          % (name, dist, station_names[k]))
                     continue
-
                 if abs(z - slots[k][2]) > 0.3:
                     z = slots[k][2]
 
-            # Set up the magazine's world transform
+            # set up the magazine's world transform
             if not mp.GetAttribute("xformOp:orient"):
-                mp.CreateAttribute(
-                    "xformOp:orient",
-                    Sdf.ValueTypeNames.Quatd
-                )
-
-            order = [
-                "xformOp:translate",
-                "xformOp:orient"
-            ]
-
+                mp.CreateAttribute("xformOp:orient", Sdf.ValueTypeNames.Quatd)
+            order = ["xformOp:translate", "xformOp:orient"]
             if mp.GetAttribute("xformOp:scale"):
                 order.append("xformOp:scale")
+            mp.GetAttribute("xformOpOrder").Set(Vt.TokenArray(order))
 
-            mp.GetAttribute("xformOpOrder").Set(
-                Vt.TokenArray(order)
-            )
-
-            # IMPORTANT: apply the new position immediately.
-            # This also ensures the following bounding-box check
-            # uses the corrected position.
-            mp.GetAttribute("xformOp:translate").Set(
-                Gf.Vec3d(x, y, z)
-            )
-
+            # apply the new position now, so the bounding-box check below uses it
+            mp.GetAttribute("xformOp:translate").Set(Gf.Vec3d(x, y, z))
             h = yaw / 2.0
             o_attr = mp.GetAttribute("xformOp:orient")
             QuatT = o_attr.GetTypeName().type.pythonClass or Gf.Quatd   # Gf.Quatf or Gf.Quatd
             o_attr.Set(QuatT(math.cos(h), 0, 0, math.sin(h)))
 
             UsdGeom.Imageable(mp).MakeVisible()
-
             if MAGAZINE_INSTANCEABLE:
                 mp.SetInstanceable(True)
 
@@ -993,55 +965,36 @@ def _run_in_omniverse():
                 "o": _W(mp.GetAttribute("xformOp:orient")),
                 "pose": (x, y, z, yaw),
                 "attach": None,
-                "prim": mp
+                "prim": mp,
             })
-
             machine_mag[k] = len(mags) - 1
             slots[k] = (x, y, z, yaw)
             kept_slots.add(k)
 
-            # Align the machine stop point with the gripper
+            # align the machine stop point with the gripper
             rb = _bbox(mp)
-
-            cx, cy = (
-                (rb.GetMidpoint()[0], rb.GetMidpoint()[1])
-                if rb is not None else (x, y)
-            )
-
+            cx, cy = (rb.GetMidpoint()[0], rb.GetMidpoint()[1]) if rb is not None else (x, y)
             s0, _ = path.project((cx, cy))
             pyaw = path.pose(s0)[2]
-
-            ox_ = (
-                math.cos(pyaw) * claw_off[0]
-                - math.sin(pyaw) * claw_off[1]
-            )
-
-            oy_ = (
-                math.sin(pyaw) * claw_off[0]
-                + math.cos(pyaw) * claw_off[1]
-            )
-
+            ox_ = math.cos(pyaw) * claw_off[0] - math.sin(pyaw) * claw_off[1]
+            oy_ = math.sin(pyaw) * claw_off[0] + math.cos(pyaw) * claw_off[1]
             s_k = path.project((cx - ox_, cy - oy_))[0]
-
             px_, py_, _ = path.pose(s_k)
-
             dx_ = px_ + ox_ - cx
             dy_ = py_ + oy_ - cy
-
             if math.hypot(dx_, dy_) < 0.5:
                 x += dx_
                 y += dy_
-
             mags[-1]["pose"] = (x, y, z, yaw)
             slots[k] = (x, y, z, yaw)
             stations_s[k] = s_k
 
-        if HIDE_ORIGINAL_MAGAZINE:
+        if HIDE_ORIGINAL_MAGAZINE and mag_tmpl.IsValid():
             UsdGeom.Imageable(mag_tmpl).MakeInvisible()
         print("[OHT Fleet] %d magazines placed on: %s"
-              % (n_mag, ", ".join(station_names[k] for k in range(len(stations_s)) if machine_mag[k] is not None)))
-    elif not existing and n_mag > 0:
-        print("[OHT Fleet] magazine template %s not found — OHTs will only move the hoist" % MAGAZINE_TEMPLATE)
+              % (len(mags), ", ".join(station_names[k] for k in range(len(stations_s)) if machine_mag[k] is not None)))
+    elif n_mag > 0:
+        print("[OHT Fleet] no magazines found in %s — OHTs will only move the hoist" % MAGAZINES_PATH)
 
     def _set_mag_pose(m, x, y, z, yaw):
         m["t"].set(Gf.Vec3d(x, y, z))
@@ -1060,6 +1013,7 @@ def _run_in_omniverse():
             cx, cy = (r_m.GetMin()[0] + r_m.GetMax()[0]) / 2, (r_m.GetMin()[1] + r_m.GetMax()[1]) / 2
             dx, dy = cx - mx0, cy - my0
             loc = (math.cos(-myaw0) * dx - math.sin(-myaw0) * dy, math.sin(-myaw0) * dx + math.cos(-myaw0) * dy)
+
             def _shift(pose):
                 x, y, z, yaw = pose
                 return (x - (math.cos(yaw) * loc[0] - math.sin(yaw) * loc[1]),
@@ -1094,6 +1048,8 @@ def _run_in_omniverse():
         x, y, yaw = path.pose(v.s)
         return x, y, oht_z + _lift(v), yaw
 
+    sim = None   # set below; the callbacks only run after it exists
+
     def on_arrive(v, k, action):
         """Decide how far to lower for this job, from the real geometry."""
         v.drop = drop_m
@@ -1101,8 +1057,8 @@ def _run_in_omniverse():
             # lower exactly until the carried magazine is back at machine height
             # start is retracted (+carry_raise); end must put the magazine at machine height
             v.drop = max(0.05, mags[v.mag]["pose"][2] - slots[k][2] - carry_raise)
-        elif action == "pick" and machine_mag_of(k) is not None:
-            mz = mags[machine_mag_of(k)]["pose"][2]
+        elif action == "pick" and sim.machine_mag[k] is not None:
+            mz = mags[sim.machine_mag[k]]["pose"][2]
             d = None
             if held_rel_z is not None and mag_mid_rel is not None:
                 # lower until the magazine is exactly where the model holds its own one
@@ -1131,12 +1087,9 @@ def _run_in_omniverse():
             print("[OHT Fleet] OHT_%02d %s %s at %s"
                   % (v.idx + 1, "picked up" if kind == "pick" else "dropped off", m["prim"].GetName(), station_names[k]))
 
-    drop_local = drop_m / hoist_scale
-
     sim = FleetSim(path, NUM_OHT, veh_len, stations_s, machine_mag)
     sim.on_event = on_event
     sim.on_arrive = on_arrive
-    machine_mag_of = lambda k: sim.machine_mag[k]
     timeline = omni.timeline.get_timeline_interface()
 
     # ---- hoist cables: attach points in the OHT's own frame
@@ -1226,30 +1179,29 @@ def _run_in_omniverse():
                     kids = [k for k in p.GetChildren() if _bbox(k) is not None]
                     groups += kids if len(kids) >= 2 else [p]   # BELT with 4 belts -> 4 cables
             for p in groups:
-                if True:
-                    r = _bbox(p)
-                    if r is None or r.GetSize()[2] < 1e-6:
+                r = _bbox(p)
+                if r is None or r.GetSize()[2] < 1e-6:
+                    continue
+                if mc is not None and others:           # only the belts of the clip that moves
+                    bc = r.GetMidpoint()
+                    d_me = math.hypot(bc[0] - mc[0], bc[1] - mc[1])
+                    if any(math.hypot(bc[0] - o[0], bc[1] - o[1]) < d_me for o in others):
                         continue
-                    if mc is not None and others:           # only the belts of the clip that moves
-                        bc = r.GetMidpoint()
-                        d_me = math.hypot(bc[0] - mc[0], bc[1] - mc[1])
-                        if any(math.hypot(bc[0] - o[0], bc[1] - o[1]) < d_me for o in others):
-                            continue
-                    on_hoist = "/Hoist_Unit/" in str(p.GetPath()) or \
-                        any(p.GetPath().HasPrefix(b) for b in builtin_paths)
-                    c = r.GetMidpoint()
-                    pivot_w = Gf.Vec3d(c[0], c[1], r.GetMin()[2] if on_hoist else r.GetMax()[2])
-                    inv = UsdGeom.Xformable(p).ComputeLocalToWorldTransform(Usd.TimeCode.Default()).GetInverse()
-                    pivot = inv.Transform(pivot_w)
-                    d = inv.TransformDir(Gf.Vec3d(0, 0, 1))
-                    axis = max(range(3), key=lambda i: abs(d[i]))
-                    xf = UsdGeom.Xformable(p)
-                    xf.AddTranslateOp(UsdGeom.XformOp.PrecisionDouble, "cablePivot").Set(pivot)
-                    s_op = xf.AddScaleOp(UsdGeom.XformOp.PrecisionDouble, "cableStretch")
-                    s_op.Set(Gf.Vec3d(1, 1, 1))
-                    xf.AddTranslateOp(UsdGeom.XformOp.PrecisionDouble, "cablePivotInv").Set(-pivot)
-                    mine.append((_W(s_op.GetAttr()), axis, r.GetSize()[2]))
-                    found_names.add(p.GetName())
+                on_hoist = "/Hoist_Unit/" in str(p.GetPath()) or \
+                    any(p.GetPath().HasPrefix(b) for b in builtin_paths)
+                c = r.GetMidpoint()
+                pivot_w = Gf.Vec3d(c[0], c[1], r.GetMin()[2] if on_hoist else r.GetMax()[2])
+                inv = UsdGeom.Xformable(p).ComputeLocalToWorldTransform(Usd.TimeCode.Default()).GetInverse()
+                pivot = inv.Transform(pivot_w)
+                d = inv.TransformDir(Gf.Vec3d(0, 0, 1))
+                axis = max(range(3), key=lambda i: abs(d[i]))
+                xf = UsdGeom.Xformable(p)
+                xf.AddTranslateOp(UsdGeom.XformOp.PrecisionDouble, "cablePivot").Set(pivot)
+                s_op = xf.AddScaleOp(UsdGeom.XformOp.PrecisionDouble, "cableStretch")
+                s_op.Set(Gf.Vec3d(1, 1, 1))
+                xf.AddTranslateOp(UsdGeom.XformOp.PrecisionDouble, "cablePivotInv").Set(-pivot)
+                mine.append((_W(s_op.GetAttr()), axis, r.GetSize()[2]))
+                found_names.add(p.GetName())
             model_cables.append(mine)
         n_found = sum(len(m) for m in model_cables)
         if n_found:
@@ -1339,7 +1291,7 @@ def _run_in_omniverse():
             try:   # Kit 105/106 (Isaac Sim 4.x)
                 self.sub = omni.kit.app.get_app().get_update_event_stream().create_subscription_to_pop(
                     self._on_update, name="oht_fleet_controller")
-            except Exception:   # newer Kit (Isaac Sim 5.x)
+            except Exception:   # newer Kit (Isaac Sim 5.x / 6.x)
                 import carb.eventdispatcher
                 self.observer = carb.eventdispatcher.get_eventdispatcher().observe_event(
                     event_name=omni.kit.app.GLOBAL_EVENT_UPDATE,
@@ -1391,8 +1343,9 @@ def _run_in_omniverse():
             print("[OHT Fleet] stopped")
 
     builtins._oht_fleet = _Handle()
-    print("[OHT Fleet] %d OHTs on a %.1f m loop, vehicle length %.2f m, hoist drop %.2f m, OHT z %.3f.%s"
-          % (NUM_OHT, path.length, veh_len, drop_m, oht_z,
+    print("[OHT Fleet] %d OHTs on a %.1f m loop, vehicle length %.2f m, hoist drop %.2f m, OHT z %.3f, "
+          "curve radius %.2f m, bogie half-spacing %.2f m.%s"
+          % (NUM_OHT, path.length, veh_len, drop_m, oht_z, CORNER_RADIUS_M, BOGIE_HALF_SPACING_M,
              " Press PLAY." if RUN_ONLY_WHEN_PLAYING else " Moving now."))
 
 
