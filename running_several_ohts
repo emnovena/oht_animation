@@ -1,5 +1,4 @@
 """
-FOR TESTING
 OHT Fleet Controller  —  multiple OHTs on one loop, no collisions
 =====================================================================
 Run in Omniverse / Isaac Sim:  Window > Script Editor > paste > Run (Ctrl+Enter),
@@ -50,10 +49,10 @@ HIDE_TEMPLATE = True
 #        -> left rail south.  The Magazine_Drop_Target is on the bottom lane.
 # A corner can also be written as (x, y, radius) if one curve differs.
 ROUTE_XY = [
-    (7.698, -24.141),
+    (7.693, -24.141),
     (29.398, -24.141),
-    (29.398, -20.241),
-    (7.698, -20.241),
+    (29.398, -18.445),
+    (7.693, -18.445),
 ]
 # Optional: use a BasisCurves/Points prim you drew instead of ROUTE_XY
 # (its points are read in order as a closed loop). Leave None to use ROUTE_XY.
