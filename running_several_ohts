@@ -1,4 +1,6 @@
 """
+THE ORIGINAL VERSION
+
 OHT Fleet Controller  —  multiple OHTs on one loop
 =====================================================================
 Run in Omniverse / Isaac Sim:  Window > Script Editor > paste > Run (Ctrl+Enter),
@@ -99,7 +101,10 @@ KEEP_SCENE_LAYOUT = True
 MAG_MATCH_RADIUS_M = 1.0       # a magazine belongs to a machine if it is this close
 MAGAZINE_MACHINE_ASSIGNMENT = {
     "MAG_01": "GM_06",
+    "MAG_02": "Ground_Machine_2",
+    "MAG_03": "GM_03",
     "MAG_04": "GM_05",
+    "MAG_05": "GM_10",
 }
 # Magazines (the carriers the OHTs grab). Copies of MAGAZINE_TEMPLATE are put
 # on every other ground machine. An empty OHT is sent to the nearest machine
