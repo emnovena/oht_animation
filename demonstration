@@ -58,7 +58,7 @@ import builtins
 TEMPLATE_PATH = "/World/OHT2grip_Revised"  # your OHT model (or "/World/OHT_Vehicle" from build_oht_vehicle.py)
 OLD_TEMPLATE_PATH = "/World/OHT_Vehicle"   # used if TEMPLATE_PATH doesn't exist
 FLEET_PATH    = "/World/OHT_Fleet"
-NUM_OHT       = 2            # default OHTs per loop (a loop can set its own "num_oht")
+NUM_OHT       = 1            # default OHTs per loop (a loop can set its own "num_oht")
 HIDE_TEMPLATE = True
 
 # ---- the real rail of the bay (world metres, measured from the rail pieces)
