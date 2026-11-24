@@ -1,0 +1,1627 @@
+"""
+OHT Fleet Controller  —  loops that follow the REAL rail of the bay
+=====================================================================
+Run in Omniverse / Isaac Sim:  Window > Script Editor > paste > Run (Ctrl+Enter),
+they start moving right away.  Re-running the script rebuilds the fleet cleanly.
+To stop it:  run   import builtins; builtins._oht_fleet.stop()
+
+What the rail in oht_animation.usd actually looks like (measured from the
+straight rail pieces; the curve meshes sit in the Orbital Line payload):
+
+        Y_TOP  -18.441  <======================================  top through-line
+                 |  ^ curve                               curve ^ |
+                 |  (joins 0.8 m NORTH of the lane)               |
+        lane   -20.241  ------------------------------------------
+                 |                                                |
+        lane   -22.041  ------------------------------------------
+                 |                                                |
+        lane   -24.141  ------------------------------------------
+                 |                                                |
+        Y_BOT  -25.891  ==========================================  bottom through-line
+              X_WEST 7.698                                 X_EAST 29.398
+
+  * The curve between a bay lane and a vertical rail always bends NORTH:
+    it meets the vertical 0.8 m north of the lane, at both ends.
+    So an OHT can only
+        - LEAVE a lane by curving north onto the vertical, and
+        - ENTER a lane from a vertical it is driving SOUTH on.
+    Going east (counter-clockwise loop) that means: lane eastbound ->
+    LEFT turn north at the east end ... LEFT turn west onto the top line ...
+    LEFT turn south at the west end ... LEFT turn east back into the lane.
+  * The old Loop_A (lane -24.141 east, lane -22.041 west) was impossible on
+    this rail: at the east end it turned LEFT into lane -22.041 and at the
+    west end LEFT out of it, but both curves there are RIGHT-turn curves for
+    that direction (they bend the other way). That is the wrong turning you saw.
+  * Every lane therefore returns over the top line, so the loops SHARE rail
+    (top line + the upper part of both verticals). The traffic logic now sees
+    OHTs of other loops on shared rail and lets them zip at the merges.
+
+Changes compared to the previous version
+  * ROUTES are built with bay_loop(lane_y): lane -> east vertical -> top line
+    -> west vertical -> lane. One loop per bay lane.
+  * CHECK_TURNS: every corner is checked against the real curve direction;
+    a loop that would turn the wrong way is reported and not used.
+  * SharedTraffic: distance keeping across loops on shared rail, merge
+    priority (who is closer to the merge goes first), collision-free start.
+  * Head-on use of the same rail by two loops is reported.
+
+Everything else (curves, bogies, braking, hoist, claws, cables, magazines)
+works exactly as before.
+"""
+
+import math
+import builtins
+
+# ---------------------------------------------------------------------------
+# SETTINGS
+# ---------------------------------------------------------------------------
+TEMPLATE_PATH = "/World/OHT2grip_Revised"  # your OHT model (or "/World/OHT_Vehicle" from build_oht_vehicle.py)
+OLD_TEMPLATE_PATH = "/World/OHT_Vehicle"   # used if TEMPLATE_PATH doesn't exist
+FLEET_PATH    = "/World/OHT_Fleet"
+NUM_OHT       = 2            # default OHTs per loop (a loop can set its own "num_oht")
+HIDE_TEMPLATE = True
+
+# ---- the real rail of the bay (world metres, measured from the rail pieces)
+X_WEST = 7.698               # west vertical (N-S) rail
+X_EAST = 29.398              # east vertical (N-S) rail
+Y_TOP  = -18.441             # top through-line, joins both verticals at the corners
+Y_BOT  = -25.891             # bottom through-line, joins both verticals at the corners
+BAY_LANES_Y = (-24.141, -22.041, -20.241)
+LANE_CURVE_SIDE = +1         # +1: lane curves meet the verticals NORTH (+Y) of the lane
+                             # -1: they meet SOUTH of it. Measured: +1 at both ends.
+CHECK_TURNS = True           # refuse loops that turn the wrong way at a lane end
+
+
+def offset_route(corners, dx=0.0, dy=0.0):
+    """copy of a loop shifted by (dx, dy) metres"""
+    return [(c[0] + dx, c[1] + dy) + tuple(c[2:]) for c in corners]
+
+
+def bay_loop(lane_y):
+    """lane (eastbound) -> LEFT up the east vertical -> LEFT onto the top line
+    (westbound) -> LEFT down the west vertical -> LEFT back into the lane.
+    Only uses curves that exist on the rail. reverse=True drives it clockwise
+    (all RIGHT turns) over the same curves."""
+    return [(X_WEST, lane_y), (X_EAST, lane_y), (X_EAST, Y_TOP), (X_WEST, Y_TOP)]
+
+
+# One loop per bay lane. They share the top line and the upper verticals.
+# Per loop:  "num_oht"  how many OHTs (0 = loop not used)
+#            "reverse"  drive it the other way round (ALL loops must then be
+#                       reversed, otherwise they meet head-on on the top line)
+#            "color"    debug line colour
+#            "prim"     optional: a BasisCurves/Points prim you drew, used
+#                       instead of "corners"
+ROUTES = [
+    {"name": "Loop_A", "corners": bay_loop(-24.141), "num_oht": 2, "reverse": False, "color": (0.1, 0.8, 0.2)},
+    {"name": "Loop_C", "corners": bay_loop(-22.041), "num_oht": 2, "reverse": False, "color": (1.0, 0.6, 0.1)},
+    {"name": "Loop_B", "corners": bay_loop(-20.241), "num_oht": 2, "reverse": False, "color": (0.2, 0.5, 1.0)},
+]
+SHARED_TOL_M = 0.05          # two loops share rail where their centrelines are this close
+LOOKAHEAD_M  = 10.0          # how far an OHT looks for OHTs of OTHER loops / merges
+MERGE_ZONE_M = 4.0           # an OHT this close to a merge has to be let in
+MERGE_CLEAR_M = 1.0          # the waiting OHT stops with its nose this far before the merge
+STATION_SNAP_M = 0.5         # a machine belongs to a loop if its port is this close to the rail
+CORNER_RADIUS_M = 0.8        # radius of the rail CENTRELINE in the curves (matches the rail)
+BOGIE_HALF_SPACING_M = 0.35  # half the distance between the front and rear wheel
+                             # units of the OHT. In curves the body sits on the
+                             # chord between them. 0 = body centre on the rail.
+REVERSE_DIRECTION = False    # default for loops that don't set "reverse"
+
+# Motion (metres, seconds)
+V_MAX        = 1.5           # cruise speed
+V_CURVE_LAT_ACC = 0.5        # lateral accel limit -> slower in curves
+A_MAX        = 0.6           # acceleration
+B_COMFORT    = 0.8           # normal braking
+B_EMERGENCY  = 3.0           # emergency braking
+TIME_HEADWAY = 1.2           # follower keeps ~this many seconds behind
+MIN_GAP_M    = 0.4           # bumper-to-bumper standstill gap
+VEHICLE_LENGTH_M = None      # None = measure from the model (fallback 1.2)
+
+# Ground machines (move & grab). Every ground machine becomes an OHT stop.
+GROUND_MACHINE_TEMPLATE  = "/World/Ground_Machine_1"     # model to copy
+EXISTING_GROUND_MACHINES = ["/World/Ground_Machine_1", "/World/Ground_Machine_2"]
+GROUND_MACHINES_PATH     = "/World/Ground_Machines"      # new copies go here
+# Where to add new machines: the point ON THE RAIL above the machine's load
+# port (X, Y). Each one is served by the loop whose rail passes over it.
+NEW_MACHINE_PORTS = [
+    (15.10, -24.141),
+    (26.30, -24.141),
+    (11.00, -20.241),
+    (16.60, -20.241),
+    (22.20, -20.241),
+    (27.00, -20.241),
+]
+# Machine origin -> load port, in the machine's own frame (metres).
+PORT_OFFSET_LOCAL = (0.29, -0.07, 0.77)
+SKIP_OVERLAPPING_MACHINES = True   # don't place a machine that would overlap another
+
+# Keep what you placed by hand (see the single-loop version for details).
+KEEP_SCENE_LAYOUT = True
+MAG_MATCH_RADIUS_M = 1.0       # a magazine belongs to a machine if it is this close
+MAGAZINE_MACHINE_ASSIGNMENT = {
+    "MAG_01": "GM_06",
+    "MAG_02": "Ground_Machine_2",
+    "MAG_03": "GM_03",
+    "MAG_04": "GM_05",
+    "MAG_05": "GM_10",
+    "MAG_06": "GM_20",
+}
+# NOTE: magazines stay on their loop. Each loop needs at least one machine
+# WITHOUT a magazine, otherwise loaded OHTs have nowhere to drop.
+MAGAZINE_TEMPLATE = "/World/full"
+MAGAZINES_PATH    = "/World/Magazines"
+NUM_MAGAZINES     = None       # None = half of the machines
+HIDE_ORIGINAL_MAGAZINE = True  # hide /World/full (the copies replace it)
+CLAW_CLOSE_M      = 0.02       # how far each claw moves INWARD to grip the magazine
+CLAW_OPEN_M       = 0.04       # how far each claw opens OUTWARD before gripping
+
+LOG_JOBS      = True           # print pick/drop events in the console
+HOIST_DROP_M  = 2.75           # fallback only (real drop is measured per job)
+GRIP_DEPTH_M  = 0.05           # how far the claw tips go below the magazine top
+CENTER_UNDER_CLAWS = True      # place magazines exactly under the claws
+CARRY_RAISE_M = None           # None = auto
+CARRY_RAISE_FALLBACK_M = 0.15  # used if auto can't measure
+HOIST_TIME_S  = 3.4            # lowering time (same for raising)
+GRIP_TIME_S   = 3.0
+
+YAW_OFFSET_DEG = 0.0         # set to 180 if the models drive backwards
+RUN_ONLY_WHEN_PLAYING = False   # True = move only while the timeline is playing
+OHT_Z_OFFSET_M = 0.0         # raise(+)/lower(-) all OHTs
+SHOW_ROUTE    = True
+
+# Hoist / claws / cables of the OHT model
+USE_BUILTIN_HOIST   = True
+HOIST_CLIPS_PARENT  = "OHT2grip_01/MOVING_PART"
+HOIST_CLIP          = "auto"
+MODEL_MAGAZINE      = "OHT2grip_01/MAGAZINE_1"
+BUILTIN_HOIST_PARTS = []
+BUILTIN_HOIST_HINTS = ("moving_part", "hoist", "gripper", "grip", "hand", "lift")
+HIDE_MODEL_PARTS    = ["OHT2grip_01/MAGAZINE_1"]
+BUILTIN_CLAW_HINTS  = ("clip", "claw", "finger")
+MODEL_CABLES     = True
+CABLE_NAME_HINTS = ("cable", "belt", "wire", "rope", "strap")
+SHOW_CABLES      = "auto"
+CABLE_TEMPLATE   = "/World/OHT_Hoist_Cables"
+CABLE_WIDTH_M    = 0.012
+CABLE_COLOR      = (0.1, 0.1, 0.1)
+
+# Performance
+MAGAZINE_INSTANCEABLE = False
+MAX_SUBSTEP_S = 0.02
+KINEMATIC_COLLIDERS = True
+PROFILE_EVERY_S = 5.0
+
+
+# ---------------------------------------------------------------------------
+# Rail check: does a loop only use curves that exist?
+# ---------------------------------------------------------------------------
+def check_route_turns(name, corners):
+    """Returns a list of problems. At the end of a bay lane the curve meets
+    the vertical rail on the LANE_CURVE_SIDE of the lane, so at a corner that
+    lies on a bay lane the vertical leg of the loop must go to that side."""
+    problems = []
+    n = len(corners)
+    want = "north" if LANE_CURVE_SIDE > 0 else "south"
+    for i in range(n):
+        p0, c, p2 = corners[i - 1], corners[i], corners[(i + 1) % n]
+        lane = next((y for y in BAY_LANES_Y if abs(c[1] - y) < 0.05), None)
+        if lane is None:
+            continue
+        for other in (p0, p2):
+            if abs(other[0] - c[0]) > 0.05 or abs(other[1] - c[1]) < 0.05:
+                continue                      # not the vertical leg
+            side = 1 if other[1] > c[1] else -1
+            if side == LANE_CURVE_SIDE:
+                continue
+            v1 = (c[0] - p0[0], c[1] - p0[1])
+            v2 = (p2[0] - c[0], p2[1] - c[1])
+            turn = "LEFT" if v1[0] * v2[1] - v1[1] * v2[0] > 0 else "RIGHT"
+            real = "RIGHT" if turn == "LEFT" else "LEFT"
+            end = "west" if abs(c[0] - X_WEST) < abs(c[0] - X_EAST) else "east"
+            problems.append(
+                "%s: corner (%.3f, %.3f) turns %s between lane Y=%.3f and the %s vertical "
+                "using a curve that bends %s - but the real curve at that lane end bends %s "
+                "(for this direction it is a %s-turn curve)."
+                % (name, c[0], c[1], turn, lane, end,
+                   "south" if want == "north" else "north", want, real))
+    return problems
+
+
+# ---------------------------------------------------------------------------
+# Route geometry
+# ---------------------------------------------------------------------------
+class LoopPath:
+    def __init__(self, corners, radius, step=0.02, name="Loop"):
+        self.name = name
+        pts = self._round_corners(corners, radius)
+        pts.append(pts[0])
+        cum = [0.0]
+        for a, b in zip(pts[:-1], pts[1:]):
+            cum.append(cum[-1] + math.hypot(b[0] - a[0], b[1] - a[1]))
+        total = cum[-1]
+        cnt = max(8, int(round(total / step)))
+        d = total / cnt
+        self.xy, j = [], 0
+        for k in range(cnt):
+            s = k * d
+            while cum[j + 1] < s:
+                j += 1
+            seg = cum[j + 1] - cum[j]
+            f = 0.0 if seg < 1e-9 else (s - cum[j]) / seg
+            a, b = pts[j], pts[j + 1]
+            self.xy.append((a[0] + (b[0] - a[0]) * f, a[1] + (b[1] - a[1]) * f))
+
+        self.s = [0.0]
+        for i in range(1, len(self.xy) + 1):
+            a, b = self.xy[i - 1], self.xy[i % len(self.xy)]
+            self.s.append(self.s[-1] + math.hypot(b[0] - a[0], b[1] - a[1]))
+        self.length = self.s[-1]
+        self.n = len(self.xy)
+        self.ds = self.length / self.n
+
+        self.yaw = []
+        for i in range(self.n):
+            a, b = self.xy[i - 1], self.xy[(i + 1) % self.n]
+            self.yaw.append(math.atan2(b[1] - a[1], b[0] - a[0]))
+
+        w = max(1, int(0.5 / self.ds))
+        raw = []
+        for i in range(self.n):
+            dyaw = self.yaw[(i + w) % self.n] - self.yaw[i - w]
+            dyaw = (dyaw + math.pi) % (2 * math.pi) - math.pi
+            kappa = abs(dyaw) / (2 * w * self.ds)
+            raw.append(V_MAX if kappa < 1e-3 else min(V_MAX, math.sqrt(V_CURVE_LAT_ACC / kappa)))
+        self.vlim = [min(raw[(i + jj) % self.n] for jj in range(-w, w + 1)) for i in range(self.n)]
+        for _ in range(2):
+            for i in range(self.n - 1, -1, -1):
+                nxt = self.vlim[(i + 1) % self.n]
+                self.vlim[i] = min(self.vlim[i], math.sqrt(nxt * nxt + 2 * B_COMFORT * self.ds))
+            for i in range(self.n):
+                prv = self.vlim[i - 1]
+                self.vlim[i] = min(self.vlim[i], math.sqrt(prv * prv + 2 * A_MAX * self.ds))
+
+    @staticmethod
+    def _round_corners(c, r):
+        """sharp corner points -> true circular arcs (like real rail curves)"""
+        out, n = [], len(c)
+        for i in range(n):
+            p0, p1, p2 = c[i - 1], c[i], c[(i + 1) % n]
+            rr = p1[2] if len(p1) > 2 else r
+            v1 = (p1[0] - p0[0], p1[1] - p0[1]); l1 = math.hypot(*v1)
+            v2 = (p2[0] - p1[0], p2[1] - p1[1]); l2 = math.hypot(*v2)
+            if l1 < 1e-6 or l2 < 1e-6:
+                continue
+            u1 = (v1[0] / l1, v1[1] / l1); u2 = (v2[0] / l2, v2[1] / l2)
+            turn = math.atan2(u1[0] * u2[1] - u1[1] * u2[0], u1[0] * u2[0] + u1[1] * u2[1])
+            if abs(turn) < math.radians(1) or rr <= 0:
+                out.append((p1[0], p1[1])); continue
+            t = rr * math.tan(abs(turn) / 2)
+            lim = 0.5 * min(l1, l2)
+            if t > lim:
+                t = lim; rr = t / math.tan(abs(turn) / 2)
+            a = (p1[0] - u1[0] * t, p1[1] - u1[1] * t)
+            side = 1.0 if turn > 0 else -1.0
+            cx, cy = a[0] - side * u1[1] * rr, a[1] + side * u1[0] * rr
+            a0 = math.atan2(a[1] - cy, a[0] - cx)
+            m = max(4, int(abs(turn) / math.radians(2)))
+            for k in range(m + 1):
+                ang = a0 + turn * k / m
+                out.append((cx + rr * math.cos(ang), cy + rr * math.sin(ang)))
+        return out
+
+    def vlim_at(self, s):
+        s = self.wrap(s)
+        i = min(self.n - 1, int(s / self.ds))
+        f = (s - i * self.ds) / self.ds
+        a, b = self.vlim[i] ** 2, self.vlim[(i + 1) % self.n] ** 2
+        return math.sqrt(a + (b - a) * f)
+
+    def wrap(self, s):
+        return s % self.length
+
+    def index(self, s):
+        return int(self.wrap(s) / self.ds) % self.n
+
+    def rail_pose(self, s):
+        s = self.wrap(s)
+        i = min(self.n - 1, int(s / self.ds))
+        j = (i + 1) % self.n
+        f = (s - i * self.ds) / self.ds
+        x = self.xy[i][0] + (self.xy[j][0] - self.xy[i][0]) * f
+        y = self.xy[i][1] + (self.xy[j][1] - self.xy[i][1]) * f
+        return x, y, self.yaw[i]
+
+    def pose(self, s):
+        if BOGIE_HALF_SPACING_M <= 0:
+            return self.rail_pose(s)
+        fx, fy, _ = self.rail_pose(s + BOGIE_HALF_SPACING_M)
+        rx, ry, _ = self.rail_pose(s - BOGIE_HALF_SPACING_M)
+        return (fx + rx) / 2, (fy + ry) / 2, math.atan2(fy - ry, fx - rx)
+
+    def project(self, xy):
+        best, bi = 1e18, 0
+        for i, p in enumerate(self.xy):
+            d = (p[0] - xy[0]) ** 2 + (p[1] - xy[1]) ** 2
+            if d < best:
+                best, bi = d, i
+        return bi * self.ds, math.sqrt(best)
+
+    def ahead(self, s_from, s_to):
+        return (s_to - s_from) % self.length
+
+
+# ---------------------------------------------------------------------------
+# Traffic logic — one FleetSim per loop, SharedTraffic couples the loops
+# ---------------------------------------------------------------------------
+def _ease(t):
+    t = max(0.0, min(1.0, t))
+    return t * t * (3 - 2 * t)
+
+
+class Vehicle:
+    def __init__(self, idx, s, path=None, loop=""):
+        self.idx = idx            # GLOBAL index over all loops (OHT_01, OHT_02, ...)
+        self.path = path          # the loop this OHT drives on
+        self.loop = loop
+        self.s = s
+        self.v = 0.0
+        self.state = "drive"      # drive | lower | grip | raise
+        self.timer = 0.0
+        self.hoist = 0.0
+        self.passes = {}
+        self.target = None
+        self.target_dist = 0.0
+        self.mag = None
+        self.action = None
+        self.claw = 0.0
+        self.drop = None
+
+
+class FleetSim:
+    def __init__(self, path, n, veh_len, stations_s, machine_mag=None, idx_offset=0, name="Loop"):
+        self.path, self.L, self.name = path, veh_len, name
+        self.stations_s = stations_s
+        self.machine_mag = list(machine_mag) if machine_mag else [None] * len(stations_s)
+        self.gk = list(range(len(stations_s)))   # local station -> global machine index
+        need = n * (veh_len + MIN_GAP_M + 0.5)
+        if need > path.length:
+            raise ValueError("%s is %.1f m but %d OHTs need %.1f m. Use fewer OHTs on it or a longer loop."
+                             % (name, path.length, n, need))
+        spacing = path.length / max(1, n)
+        self.veh = [Vehicle(idx_offset + i, i * spacing, path, name) for i in range(n)]
+        self.min_gap_seen = 1e9
+        self.on_event = None
+        self.on_arrive = None
+        for v in self.veh:
+            self._next_target(v)
+
+    def own_leaders(self):
+        """{vehicle idx: (centre distance ahead, leader)} using only this loop"""
+        out = {}
+        for v in self.veh:
+            best = None
+            for o in self.veh:
+                if o is v:
+                    continue
+                d = self.path.ahead(v.s, o.s)
+                if best is None or d < best[0]:
+                    best = (d, o, o.v)
+            out[v.idx] = best
+        return out
+
+    def gap_to_leader(self, v):
+        lead = self.own_leaders().get(v.idx)
+        if lead is None:
+            return float("inf"), None
+        return lead[0] - self.L, lead[1]
+
+    def _next_target(self, v):
+        v.target = None
+        if not self.stations_s:
+            return
+        want_loaded = v.mag is None
+        taken = {o.target[0] for o in self.veh if o is not v and o.target}
+        best = None
+        for k, ss in enumerate(self.stations_s):
+            if k in taken or (self.machine_mag[k] is not None) != want_loaded:
+                continue
+            d = self.path.ahead(v.s, ss)
+            if d < 0.05:
+                continue
+            if best is None or d < best[0]:
+                best = (d, k, ss)
+        if best:
+            d, k, ss = best
+            v.target, v.target_dist = (k, ss), d
+
+    def step(self, dt):
+        """stand-alone stepping (one loop, no shared rail). The fleet uses SharedTraffic."""
+        dt = min(dt, 0.25)
+        n = max(1, int(math.ceil(dt / MAX_SUBSTEP_S)))
+        for _ in range(n):
+            self._substep(dt / n, self.own_leaders())
+
+    def _substep(self, dt, leaders):
+        """leaders: {vehicle idx: (centre distance ahead, leader, leader speed) or None},
+        computed for ALL vehicles before anybody moves in this substep."""
+        for v in self.veh:
+            if v.state != "drive":
+                self._station_work(v, dt)
+                continue
+            lead = leaders.get(v.idx)
+            if lead is None:
+                v_lead_lim, max_move = V_MAX, 1e9
+            else:
+                dist, _, lv = lead
+                free = dist - self.L - MIN_GAP_M
+                max_move = free
+                if free <= 0:
+                    v_lead_lim = 0.0
+                else:
+                    v_lead_lim = min(math.sqrt(lv ** 2 + 2 * B_COMFORT * free),
+                                     lv + free / TIME_HEADWAY)
+            v_curve = self.path.vlim_at(v.s + v.v * dt)
+            if v.target is None:
+                self._next_target(v)
+            v_stn = V_MAX
+            if v.target:
+                ds = max(0.0, v.target_dist)
+                v_stn = math.sqrt(2 * B_COMFORT * max(0.0, ds - v.v * dt))
+                if ds <= 1e-4:
+                    k = v.target[0]
+                    v.s, v.v, v.state, v.timer = v.target[1], 0.0, "lower", 0.0
+                    if v.mag is None and self.machine_mag[k] is not None:
+                        v.action = "pick"
+                    elif v.mag is not None and self.machine_mag[k] is None:
+                        v.action = "drop"
+                    else:
+                        v.action = None
+                    if self.on_arrive:
+                        self.on_arrive(v, k, v.action)
+                    continue
+            v_target = min(V_MAX, v_lead_lim, v_curve, v_stn)
+            if v_target >= v.v:
+                v.v = min(v_target, v.v + A_MAX * dt)
+            else:
+                v.v = max(v_target, v.v - B_EMERGENCY * dt)
+            move = min(v.v * dt, max(0.0, max_move))
+            if v.target:
+                move = min(move, max(0.0, v.target_dist))
+            if move < v.v * dt:
+                v.v = move / dt
+            v.s = self.path.wrap(v.s + move)
+            if v.target:
+                v.target_dist -= move
+
+    def _station_work(self, v, dt):
+        v.timer += dt
+        k = v.target[0]
+        if v.state == "lower":
+            v.hoist = _ease(v.timer / HOIST_TIME_S)
+            if v.action == "pick":
+                v.claw = -CLAW_OPEN_M * _ease(v.timer / (0.4 * HOIST_TIME_S))
+            if v.timer >= HOIST_TIME_S:
+                v.state, v.timer, v.hoist = "grip", 0.0, 1.0
+        elif v.state == "grip":
+            f = _ease(v.timer / GRIP_TIME_S)
+            if v.action == "pick":
+                v.claw = -CLAW_OPEN_M + (CLAW_CLOSE_M + CLAW_OPEN_M) * f
+            elif v.action == "drop":
+                v.claw = CLAW_CLOSE_M - (CLAW_CLOSE_M + CLAW_OPEN_M) * f
+            if v.timer >= GRIP_TIME_S:
+                if v.action == "pick":
+                    v.mag, self.machine_mag[k] = self.machine_mag[k], None
+                    if self.on_event:
+                        self.on_event(v, k, "pick", v.mag)
+                elif v.action == "drop":
+                    mag, v.mag = v.mag, None
+                    self.machine_mag[k] = mag
+                    if self.on_event:
+                        self.on_event(v, k, "drop", mag)
+                v.state, v.timer = "raise", 0.0
+        elif v.state == "raise":
+            v.hoist = 1.0 - _ease(v.timer / HOIST_TIME_S)
+            if v.action == "drop":
+                v.claw = -CLAW_OPEN_M * (1.0 - _ease((v.timer / HOIST_TIME_S - 0.1) / 0.5))
+            if v.timer >= HOIST_TIME_S:
+                v.state, v.hoist, v.action = "drive", 0.0, None
+                self._next_target(v)
+
+
+class SharedTraffic:
+    """Couples the loops. Where two loops run on the same rail, an OHT keeps
+    its distance to OHTs of the other loop too. Before a merge, the OHT that
+    is closer to the merge point goes first; the other one treats it as if it
+    were already driving in front of it (so they zip in without touching)."""
+
+    def __init__(self, sims, tol=SHARED_TOL_M, look=LOOKAHEAD_M):
+        self.sims = sims
+        self.paths = [s.path for s in sims]
+        self.look = look
+        self.L = sims[0].L if sims else 1.2
+        n = len(sims)
+        self.map = [[None] * n for _ in range(n)]       # map[j][i][k]: sample k of loop j -> s on loop i
+        self.merges = [[[] for _ in range(n)] for _ in range(n)]
+        self.diverges = [[[] for _ in range(n)] for _ in range(n)]
+        self.shared_len = {}
+        self.head_on = []
+        for i in range(n):
+            for j in range(n):
+                if i == j:
+                    continue
+                m, opp = self._match(self.paths[i], self.paths[j], tol)
+                if opp and i < j:
+                    self.head_on.append((self.paths[i].name, self.paths[j].name, opp[0], len(opp) * self.paths[i].ds))
+                if not any(x is not None for x in m):
+                    continue
+                self.map[i][j] = m
+                self.shared_len[(i, j)] = sum(1 for x in m if x is not None) * self.paths[i].ds
+                Pi, Pj = self.paths[i], self.paths[j]
+                for k in range(Pi.n):
+                    if m[k] is not None and m[k - 1] is None:
+                        self.merges[i][j].append((k * Pi.ds, m[k]))
+                    elif m[k] is None and m[k - 1] is not None:
+                        self.diverges[i][j].append((k * Pi.ds, Pj.wrap(m[k - 1] + Pj.ds)))
+        self.min_gap_seen = 1e9
+
+    @staticmethod
+    def _match(A, B, tol):
+        """for every sample of A: s on B if B runs on the same rail in the same direction"""
+        cell = max(2 * tol, 0.1)
+        grid = {}
+        for k, (x, y) in enumerate(B.xy):
+            grid.setdefault((int(math.floor(x / cell)), int(math.floor(y / cell))), []).append(k)
+        out, opp = [None] * A.n, []
+        cos_lim = math.cos(math.radians(30))
+        for k, (x, y) in enumerate(A.xy):
+            cx, cy = int(math.floor(x / cell)), int(math.floor(y / cell))
+            best = None
+            for gx in (cx - 1, cx, cx + 1):
+                for gy in (cy - 1, cy, cy + 1):
+                    for kb in grid.get((gx, gy), ()):
+                        bx, by = B.xy[kb]
+                        d2 = (bx - x) ** 2 + (by - y) ** 2
+                        if d2 <= tol * tol and (best is None or d2 < best[0]):
+                            best = (d2, kb)
+            if best is None:
+                continue
+            c = math.cos(A.yaw[k] - B.yaw[best[1]])
+            if c >= cos_lim:
+                out[k] = best[1] * B.ds
+            elif c <= -cos_lim:
+                opp.append((x, y))
+        return out, opp
+
+    def _on_path(self, i, j, o):
+        """position of vehicle o (loop j) on loop i, or None if o is not on loop i's rail"""
+        m = self.map[j][i]
+        return None if m is None else m[self.paths[j].index(o.s)]
+
+    def _merge_rule(self, i, v, j, o):
+        """o (loop j) is on another branch. Does v (loop i) have to give way to
+        it at a merge, or keep behind it right after a diverge?
+        Returns (centre distance, leader speed) of the constraint, or None."""
+        P, Pj, L = self.paths[i], self.paths[j], self.L
+        stop_off = L / 2 + MERGE_CLEAR_M          # v's centre stops this far before the merge
+        best = None
+        for s_i, s_j in self.merges[i][j]:
+            dv = P.ahead(v.s, s_i)
+            do = Pj.ahead(o.s, s_j)
+            if dv > self.look or do > MERGE_ZONE_M:
+                continue
+            o_first = do < dv or (abs(do - dv) < 1e-9 and o.idx < v.idx)
+            v_comm = dv - stop_off < v.v * v.v / (2 * B_COMFORT) + 0.05
+            o_comm = do - stop_off < o.v * o.v / (2 * B_COMFORT) + 0.05
+            if v_comm and not o_comm:
+                o_first = False
+            elif o_comm and not v_comm:
+                o_first = True
+            if not o_first:
+                continue
+            if dv - do >= L + MIN_GAP_M:
+                c = (dv - do, o.v)                    # zip in behind o
+            else:
+                c = (dv - stop_off + L + MIN_GAP_M, 0.0)   # wait at the stop line
+            if best is None or c[0] < best[0]:
+                best = c
+        for s_i, s_j in self.diverges[i][j]:
+            dv = P.ahead(v.s, s_i)
+            past = Pj.ahead(s_j, o.s)
+            if dv > self.look or past > L + MIN_GAP_M + MERGE_CLEAR_M:
+                continue
+            c = (dv + past, o.v)                      # o has not cleared the switch yet
+            if best is None or c[0] < best[0]:
+                best = c
+        return best
+
+    def leaders(self):
+        allv = [(i, v) for i, s in enumerate(self.sims) for v in s.veh]
+        out = {}
+        for i, v in allv:
+            P = self.paths[i]
+            best = None
+            for j, o in allv:
+                if o is v:
+                    continue
+                if j == i:
+                    c = (P.ahead(v.s, o.s), o.v)
+                else:
+                    so = self._on_path(i, j, o)
+                    if so is not None:                 # o is on my rail
+                        c = (P.ahead(v.s, so), o.v)
+                        if c[0] > self.look:
+                            continue
+                    else:                              # o is on another branch
+                        c = self._merge_rule(i, v, j, o)
+                        if c is None:
+                            continue
+                if best is None or c[0] < best[0]:
+                    best = (c[0], o, c[1])
+            out[v.idx] = best
+        return out
+
+    def physical_min_gap(self):
+        """smallest bumper gap between OHTs that really are on the same rail"""
+        g = 1e9
+        for i, s in enumerate(self.sims):
+            for v in s.veh:
+                for j, s2 in enumerate(self.sims):
+                    for o in s2.veh:
+                        if o is v:
+                            continue
+                        so = o.s if i == j else self._on_path(i, j, o)
+                        if so is None:
+                            continue
+                        g = min(g, self.paths[i].ahead(v.s, so) - self.L)
+        return g
+
+    def place_initial(self):
+        """spread the OHTs so nobody starts on top of an OHT of another loop"""
+        need = self.L + MIN_GAP_M + 0.3
+        placed = []                                     # (loop, s)
+
+        def ok(i, s):
+            P = self.paths[i]
+            x, y, _ = P.rail_pose(s)
+            for j, sj in placed:
+                if j == i:
+                    d = min(P.ahead(s, sj), P.ahead(sj, s))
+                    if d < need:
+                        return False
+                    continue
+                m = self.map[i][j]
+                mine = m[P.index(s)] if m else None
+                if mine is not None:                    # same rail: along-track distance
+                    Pj = self.paths[j]
+                    if min(Pj.ahead(mine, sj), Pj.ahead(sj, mine)) < need:
+                        return False
+                xj, yj, _ = self.paths[j].rail_pose(sj)
+                if math.hypot(x - xj, y - yj) < self.L:  # different rail, but bodies too close
+                    return False
+            return True
+
+        for i, sim in enumerate(self.sims):
+            P, n = sim.path, len(sim.veh)
+            if n == 0:
+                continue
+            spacing = P.length / n
+            chosen = None
+            for t in range(60):
+                cand = [P.wrap(spacing * (k + t / 60.0)) for k in range(n)]
+                if all(ok(i, c) for c in cand):
+                    chosen = cand
+                    break
+            if chosen is None:                           # greedy fallback
+                chosen, s = [], 0.0
+                while s < P.length and len(chosen) < n:
+                    if ok(i, s):
+                        chosen.append(s)
+                        placed.append((i, s))
+                        s += need
+                    else:
+                        s += 0.05
+                placed = [p for p in placed if p[0] != i]
+                if len(chosen) < n:
+                    raise ValueError("%s: no room to place %d OHTs without overlapping other loops"
+                                     % (sim.name, n))
+            for v, c in zip(sim.veh, chosen):
+                v.s, v.v = c, 0.0
+                placed.append((i, c))
+            for v in sim.veh:
+                v.target = None
+            for v in sim.veh:
+                sim._next_target(v)
+
+    def step(self, dt):
+        dt = min(dt, 0.25)
+        n = max(1, int(math.ceil(dt / MAX_SUBSTEP_S)))
+        h = dt / n
+        for _ in range(n):
+            leaders = self.leaders()
+            for s in self.sims:
+                s._substep(h, leaders)
+
+    def summary(self):
+        lines = []
+        n = len(self.sims)
+        for i in range(n):
+            for j in range(i + 1, n):
+                if (i, j) in self.shared_len:
+                    lines.append("%s & %s share %.1f m of rail (%d merge point%s)"
+                                 % (self.paths[i].name, self.paths[j].name, self.shared_len[(i, j)],
+                                    len(self.merges[i][j]), "" if len(self.merges[i][j]) == 1 else "s"))
+        return lines
+
+
+# ---------------------------------------------------------------------------
+# Omniverse glue
+# ---------------------------------------------------------------------------
+def _run_in_omniverse():
+    import omni.usd
+    import omni.kit.app
+    import omni.timeline
+    from pxr import Usd, UsdGeom, UsdPhysics, Sdf, Gf, Vt
+
+    old = getattr(builtins, "_oht_fleet", None)
+    if old is not None:
+        old.stop()
+
+    class _W:
+        """Fast attribute writer: skips unchanged values, writes to the layer directly."""
+        __slots__ = ("attr", "spec", "cls", "last")
+
+        def __init__(self, attr):
+            self.attr, self.spec, self.last = attr, None, None
+            self.cls = attr.GetTypeName().type.pythonClass
+
+        def set(self, value):
+            if self.cls is not None and not isinstance(value, self.cls):
+                value = self.cls(value)
+            if value == self.last:
+                return
+            self.last = value
+            if self.spec is None:
+                self.attr.Set(value)
+                layer = stage.GetEditTarget().GetLayer()
+                self.spec = layer.GetAttributeAtPath(self.attr.GetPath()) or False
+            elif self.spec:
+                self.spec.default = value
+            else:
+                self.attr.Set(value)
+
+    stage = omni.usd.get_context().get_stage()
+    tmpl = stage.GetPrimAtPath(TEMPLATE_PATH)
+    template_path = TEMPLATE_PATH
+    if not tmpl.IsValid():
+        tmpl = stage.GetPrimAtPath(OLD_TEMPLATE_PATH)
+        template_path = OLD_TEMPLATE_PATH
+        print("[OHT Fleet] %s not found — using %s" % (TEMPLATE_PATH, OLD_TEMPLATE_PATH))
+    if not tmpl.IsValid():
+        raise RuntimeError("Template prim not found: " + TEMPLATE_PATH)
+
+    # ---- routes: one LoopPath per loop, each checked against the real curves
+    loops = []                       # (route dict, LoopPath, number of OHTs)
+    for li, r in enumerate(ROUTES):
+        n_r = int(r.get("num_oht", NUM_OHT))
+        if n_r <= 0:
+            continue
+        name = r.get("name", "Loop_%d" % (li + 1))
+        if r.get("prim"):
+            pts = stage.GetPrimAtPath(r["prim"]).GetAttribute("points").Get()
+            corners = [(float(p[0]), float(p[1])) for p in pts]
+        else:
+            corners = list(r["corners"])
+        if r.get("reverse", REVERSE_DIRECTION):
+            corners.reverse()
+        if CHECK_TURNS:
+            bad = check_route_turns(name, corners)
+            if bad:
+                for msg in bad:
+                    print("[OHT Fleet] WRONG TURN  " + msg)
+                print("[OHT Fleet] %s is NOT used — an OHT can't drive it on this rail. "
+                      "Build it with bay_loop(lane_y) or set CHECK_TURNS = False." % name)
+                continue
+        loops.append((r, LoopPath(corners, r.get("radius", CORNER_RADIUS_M), name=name), n_r))
+    if not loops:
+        raise RuntimeError("No usable loop in ROUTES (num_oht > 0 and only real curves)")
+    paths = [lp for _, lp, _ in loops]
+    total_oht = sum(n for _, _, n in loops)
+
+    # ---- template info
+    t_attr = tmpl.GetAttribute("xformOp:translate:oht")
+    oht_z = float(t_attr.Get()[2]) if t_attr and t_attr.Get() is not None else -0.199
+    oht_z += OHT_Z_OFFSET_M
+    base = tmpl.GetCustomDataByKey("ohtFollowerBaseOrient")
+    base_q = Gf.Quatd(base[0], base[1], base[2], base[3]) if base is not None else Gf.Quatd(1, 0, 0, 0)
+
+    veh_len = VEHICLE_LENGTH_M
+    if veh_len is None:
+        veh_len = 1.2
+        try:
+            cache = UsdGeom.BBoxCache(Usd.TimeCode.Default(), [UsdGeom.Tokens.default_, UsdGeom.Tokens.render])
+            rng = cache.ComputeWorldBound(tmpl).ComputeAlignedRange()
+            if not rng.IsEmpty():
+                size = rng.GetSize()
+                veh_len = max(0.6, min(2.0, max(size[0], size[1])))
+        except Exception:
+            pass
+
+    drop_m = HOIST_DROP_M if HOIST_DROP_M is not None else 2.5
+
+    # ---- fleet prims (all loops: OHT_01..N, numbered loop after loop)
+    fleet = UsdGeom.Xform.Define(stage, FLEET_PATH).GetPrim()
+    for child in list(fleet.GetChildren()):
+        stage.RemovePrim(child.GetPath())
+
+    src_layer = None
+    for layer in stage.GetLayerStack():
+        if layer.GetPrimAtPath(template_path):
+            src_layer = layer
+            break
+    dst_layer = stage.GetEditTarget().GetLayer()
+
+    prims = []
+    for i in range(total_oht):
+        p = "%s/OHT_%02d" % (FLEET_PATH, i + 1)
+        Sdf.CopySpec(src_layer, template_path, dst_layer, p)
+        prim = stage.GetPrimAtPath(p)
+        prim.ClearCustomDataByKey("ohtFollowerMagazine")
+        UsdGeom.Imageable(prim).MakeVisible()
+        hoist = stage.GetPrimAtPath(p + "/Hoist_Unit")
+        hoist_attr = hoist.GetAttribute("xformOp:translate:hoistDrop") if hoist.IsValid() else None
+        claws = []
+        for cname in ("Claw_Front", "Claw_Back"):
+            cp = stage.GetPrimAtPath(p + "/Hoist_Unit/" + cname)
+            if cp.IsValid() and cp.GetAttribute("xformOp:translate").Get() is not None:
+                a = cp.GetAttribute("xformOp:translate")
+                claws.append((_W(a), Gf.Vec3d(a.Get())))
+        prims.append((prim.GetAttribute("xformOp:translate:oht"),
+                      prim.GetAttribute("xformOp:orient:oht"),
+                      hoist_attr, prim, claws))
+    if HIDE_TEMPLATE:
+        UsdGeom.Imageable(tmpl).MakeInvisible()
+
+    def _qyaw(q):
+        return 2 * math.atan2(q.GetImaginary()[2], q.GetReal())
+    base_yaw = _qyaw(base_q)
+    yaw_off = math.radians(YAW_OFFSET_DEG)
+
+    def _bbox(prim):
+        try:
+            c_ = UsdGeom.BBoxCache(Usd.TimeCode.Default(), [UsdGeom.Tokens.default_, UsdGeom.Tokens.render])
+            r = c_.ComputeWorldBound(prim).ComputeAlignedRange()
+            return None if r.IsEmpty() else r
+        except Exception:
+            return None
+
+    # ---- the model's own (built-in) hoists
+    builtin = []
+    builtin_claws = []
+    builtin_paths = []
+    clip_info = []
+    held_ref = [None, None]
+    builtin_box = None
+    if USE_BUILTIN_HOIST:
+        names, claw_names = set(), set()
+        for _, _, _, prim, _ in prims:
+            mine, skip, my_claws = [], None, []
+            addon = prim.GetPath().AppendChild("Hoist_Unit")
+            cands = []
+            other_centers, chosen_center = [], None
+            parent = stage.GetPrimAtPath(prim.GetPath().AppendPath(Sdf.Path(HOIST_CLIPS_PARENT)))
+            if not BUILTIN_HOIST_PARTS and parent and parent.IsValid():
+                clips = sorted([c for c in parent.GetChildren() if "clip" in c.GetName().lower()],
+                               key=lambda c: c.GetName())
+                centers = {c.GetName(): (_bbox(c).GetMidpoint() if _bbox(c) is not None else None) for c in clips}
+                chosen = None
+                if clips and HOIST_CLIP != "auto":
+                    chosen = next((c for c in clips if c.GetName() == HOIST_CLIP), None)
+                if clips and chosen is None:
+                    mag = stage.GetPrimAtPath(prim.GetPath().AppendPath(Sdf.Path(MODEL_MAGAZINE)))
+                    rm = _bbox(mag) if mag and mag.IsValid() else None
+                    with_c = [c for c in clips if centers[c.GetName()] is not None]
+                    if rm is not None and with_c:
+                        mc = rm.GetMidpoint()
+                        chosen = min(with_c, key=lambda c: math.hypot(centers[c.GetName()][0] - mc[0],
+                                                                       centers[c.GetName()][1] - mc[1]))
+                    else:
+                        chosen = clips[0]
+                if chosen is not None and prim is prims[0][3]:
+                    mag_ref = stage.GetPrimAtPath(prim.GetPath().AppendPath(Sdf.Path(MODEL_MAGAZINE)))
+                    held_ref[0] = _bbox(mag_ref) if mag_ref and mag_ref.IsValid() else None
+                    held_ref[1] = _bbox(chosen)
+                if chosen is not None:
+                    cands = [chosen]
+                    chosen_center = centers[chosen.GetName()]
+                    other_centers = [centers[c.GetName()] for c in clips
+                                     if c is not chosen and centers[c.GetName()] is not None]
+            clip_info.append((chosen_center, other_centers))
+            if not cands and BUILTIN_HOIST_PARTS:
+                cands = [stage.GetPrimAtPath(prim.GetPath().AppendPath(Sdf.Path(rel)))
+                         for rel in BUILTIN_HOIST_PARTS]
+                cands = [c for c in cands if c and c.IsValid()]
+                if not cands and prim is prims[0][3]:
+                    print("[OHT Fleet] BUILTIN_HOIST_PARTS %s not found in the OHT — searching by name"
+                          % BUILTIN_HOIST_PARTS)
+            if not cands:
+                cands = [p for p in Usd.PrimRange(prim)
+                         if not p.GetPath().HasPrefix(addon)
+                         and any(h in p.GetName().lower() for h in BUILTIN_HOIST_HINTS)
+                         and not any(h in p.GetName().lower() for h in CABLE_NAME_HINTS)]
+            for p in cands:
+                if not p or not p.IsValid() or (skip and any(p.GetPath().HasPrefix(s) for s in skip)):
+                    continue
+                skip = (skip or []) + [p.GetPath()]
+                xf = UsdGeom.Xformable(p)
+                inv = xf.ComputeLocalToWorldTransform(Usd.TimeCode.Default()).GetInverse()
+                op = xf.AddTranslateOp(UsdGeom.XformOp.PrecisionDouble, "builtinHoist")
+                mine.append((_W(op.GetAttr()), inv.TransformDir(Gf.Vec3d(0, 0, 1))))
+                names.add(p.GetName())
+                builtin_paths.append(p.GetPath())
+                fingers, taken = [], []
+                for q in Usd.PrimRange(p):
+                    if q == p or not any(h in q.GetName().lower() for h in BUILTIN_CLAW_HINTS):
+                        continue
+                    if any(q.GetPath().HasPrefix(t) for t in taken):
+                        continue
+                    taken.append(q.GetPath())
+                    r_q = _bbox(q)
+                    if r_q is not None:
+                        fingers.append((q, r_q.GetMidpoint()))
+                if len(fingers) < 2:
+                    for q in Usd.PrimRange(p):
+                        kids = [k for k in q.GetChildren() if _bbox(k) is not None]
+                        if q != p and len(kids) >= 2 and any(h in q.GetName().lower() for h in BUILTIN_CLAW_HINTS):
+                            fingers = [(k, _bbox(k).GetMidpoint()) for k in kids]
+                            break
+                if len(fingers) >= 2:
+                    mid = sum((f[1] for f in fingers), Gf.Vec3d(0, 0, 0)) / len(fingers)
+                    for q, cq in fingers:
+                        dv = Gf.Vec3d(cq[0] - mid[0], cq[1] - mid[1], 0.0)
+                        if dv.GetLength() < 1e-3:
+                            continue
+                        qx = UsdGeom.Xformable(q)
+                        q_inv = qx.ComputeLocalToWorldTransform(Usd.TimeCode.Default()).GetInverse()
+                        c_op = qx.AddTranslateOp(UsdGeom.XformOp.PrecisionDouble, "builtinClaw")
+                        my_claws.append((_W(c_op.GetAttr()), q_inv.TransformDir(dv.GetNormalized()), q.GetPath()))
+                        claw_names.add(q.GetName())
+                if prim is prims[0][3]:
+                    r = _bbox(p)
+                    if r is not None:
+                        builtin_box = r if builtin_box is None else Gf.Range3d(
+                            Gf.Vec3d(*[min(builtin_box.GetMin()[i], r.GetMin()[i]) for i in range(3)]),
+                            Gf.Vec3d(*[max(builtin_box.GetMax()[i], r.GetMax()[i]) for i in range(3)]))
+            builtin.append(mine)
+            builtin_claws.append(my_claws)
+        if any(builtin):
+            print("[OHT Fleet] hoist that goes down: %s, its fingers: %s"
+                  % (", ".join(sorted(names)), ", ".join(sorted(claw_names)) or "none found"))
+            for _, _, _, prim, _ in prims:
+                hu = stage.GetPrimAtPath(prim.GetPath().AppendChild("Hoist_Unit"))
+                if hu.IsValid():
+                    UsdGeom.Imageable(hu).MakeInvisible()
+                for rel in HIDE_MODEL_PARTS:
+                    hp = stage.GetPrimAtPath(prim.GetPath().AppendPath(Sdf.Path(rel)))
+                    if hp and hp.IsValid():
+                        UsdGeom.Imageable(hp).MakeInvisible()
+        else:
+            builtin, builtin_claws = [], []
+            print("[OHT Fleet] no built-in hoist found by name (%s) — still using Hoist_Unit."
+                  % ", ".join(BUILTIN_HOIST_HINTS))
+
+    claw_off = (0.0, 0.0)
+    hu0 = stage.GetPrimAtPath(FLEET_PATH + "/OHT_01/Hoist_Unit")
+    r_h = builtin_box if builtin_box is not None else (_bbox(hu0) if hu0.IsValid() else None)
+    held_box = held_ref[0] if builtin else None
+    held_rel_z = None
+    ref_box = held_box if held_box is not None else r_h
+    if held_box is not None:
+        held_rel_z = held_box.GetMidpoint()[2] - prims[0][0].Get()[2]
+        print("[OHT Fleet] held magazine position taken from %s" % MODEL_MAGAZINE)
+    if ref_box is not None and CENTER_UNDER_CLAWS:
+        o0 = prims[0][0].Get()
+        cx, cy = ref_box.GetMidpoint()[0], ref_box.GetMidpoint()[1]
+        th = -(_qyaw(prims[0][1].Get()) - base_yaw - yaw_off)
+        dx, dy = cx - o0[0], cy - o0[1]
+        claw_off = (math.cos(th) * dx - math.sin(th) * dy, math.sin(th) * dx + math.cos(th) * dy)
+        print("[OHT Fleet] claws are %.3f m / %.3f m from the OHT origin" % claw_off)
+
+    carry_raise = CARRY_RAISE_M
+    if carry_raise is None and builtin:
+        carry_raise = 0.0
+    if carry_raise is None and tmpl.GetCustomDataByKey("ohtGenerated"):
+        carry_raise = 0.0
+    if carry_raise is None:
+        carry_raise = CARRY_RAISE_FALLBACK_M
+        try:
+            oht0 = prims[0][3]
+            body_min = None
+            for ch in oht0.GetChildren():
+                if ch.GetName() in ("Hoist_Unit",):
+                    continue
+                r = _bbox(ch)
+                if r is not None:
+                    body_min = r.GetMin()[2] if body_min is None else min(body_min, r.GetMin()[2])
+            r_mag = _bbox(stage.GetPrimAtPath(MAGAZINE_TEMPLATE))
+            if body_min is not None and r_h is not None and r_mag is not None:
+                mag_h = r_mag.GetMax()[2] - r_mag.GetMin()[2]
+                mag_bottom_at_rest = r_h.GetMin()[2] + GRIP_DEPTH_M - mag_h
+                carry_raise = max(0.0, min(2.0, body_min - mag_bottom_at_rest))
+                print("[OHT Fleet] carry raise measured: %.2f m" % carry_raise)
+        except Exception as ex:
+            print("[OHT Fleet] carry raise measure failed (%s) — using %.2f m" % (ex, carry_raise))
+
+    hoist_scale = 1.0
+    sc = prims[0][3].GetAttribute("xformOp:scale:oht")
+    if sc and sc.Get() is not None and abs(sc.Get()[2]) > 1e-9:
+        hoist_scale = abs(sc.Get()[2])
+
+    # ---- one debug line per loop, each in its own colour (stacked a little
+    #      in height so you can see the shared rail carries several loops)
+    if SHOW_ROUTE:
+        for li, (r, lp, _) in enumerate(loops):
+            c = UsdGeom.BasisCurves.Define(stage, "%s/Route_Debug_%s" % (FLEET_PATH, lp.name))
+            z = 0.065 + 0.01 * li
+            pts = [Gf.Vec3f(x, y, z) for x, y in lp.xy] + [Gf.Vec3f(lp.xy[0][0], lp.xy[0][1], z)]
+            c.CreatePointsAttr(Vt.Vec3fArray(pts))
+            c.CreateCurveVertexCountsAttr([len(pts)])
+            c.CreateTypeAttr("linear")
+            c.CreateWidthsAttr([0.03])
+            c.CreateDisplayColorAttr([Gf.Vec3f(*r.get("color", (0.1, 0.8, 0.2)))])
+
+    # ---- ground machines -> stations
+    def _world(prim):
+        m = Gf.Matrix4d(1.0)
+        p = prim
+        while p and p.GetPath() != Sdf.Path.absoluteRootPath:
+            m = m * UsdGeom.Xformable(p).GetLocalTransformation(Usd.TimeCode.Default())
+            p = p.GetParent()
+        t = m.ExtractTranslation()
+        return t[0], t[1], t[2], math.atan2(m[0][1], m[0][0])
+
+    def _yaw_of(prim):
+        return _world(prim)[3]
+
+    def _port_of(prim):
+        t = _world(prim)
+        yaw = t[3]
+        ox, oy, oz = PORT_OFFSET_LOCAL
+        c, s_ = math.cos(yaw), math.sin(yaw)
+        return (t[0] + c * ox - s_ * oy, t[1] + s_ * ox + c * oy, t[2] + oz)
+
+    def _footprint(prim):
+        try:
+            cache = UsdGeom.BBoxCache(Usd.TimeCode.Default(), [UsdGeom.Tokens.default_, UsdGeom.Tokens.render])
+            r = cache.ComputeWorldBound(prim).ComputeAlignedRange()
+            if r.IsEmpty():
+                return None
+            return (r.GetMin()[0], r.GetMin()[1], r.GetMax()[0], r.GetMax()[1])
+        except Exception:
+            return None
+
+    def _overlap(a, b, margin=0.05):
+        return not (a[2] + margin <= b[0] or b[2] + margin <= a[0] or
+                    a[3] + margin <= b[1] or b[3] + margin <= a[1])
+
+    machines = [stage.GetPrimAtPath(p) for p in EXISTING_GROUND_MACHINES]
+    machines = [m for m in machines if m.IsValid()]
+    gm_tmpl = stage.GetPrimAtPath(GROUND_MACHINE_TEMPLATE)
+    gm_root = stage.GetPrimAtPath(GROUND_MACHINES_PATH)
+    keep_machines = KEEP_SCENE_LAYOUT and gm_root.IsValid() and len(gm_root.GetChildren()) > 0
+    if keep_machines:
+        kept = sorted(gm_root.GetChildren(), key=lambda p: p.GetName())
+        machines += kept
+        print("[OHT Fleet] keeping your %d machines in %s where they are" % (len(kept), GROUND_MACHINES_PATH))
+    elif gm_root.IsValid():
+        stage.RemovePrim(gm_root.GetPath())
+    if not keep_machines and gm_tmpl.IsValid() and NEW_MACHINE_PORTS:
+        UsdGeom.Xform.Define(stage, GROUND_MACHINES_PATH)
+        gm_layer = None
+        for layer in stage.GetLayerStack():
+            if layer.GetPrimAtPath(GROUND_MACHINE_TEMPLATE):
+                gm_layer = layer
+                break
+        t0 = gm_tmpl.GetAttribute("xformOp:translate").Get()
+        yaw0 = _yaw_of(gm_tmpl)
+        fp0 = _footprint(gm_tmpl)
+        if fp0 is None and SKIP_OVERLAPPING_MACHINES:
+            print("[OHT Fleet] could not measure the ground machine size — overlap check skipped")
+        boxes = [b for b in (_footprint(m) for m in machines) if b]
+        ox, oy, _ = PORT_OFFSET_LOCAL
+        c, s_ = math.cos(yaw0), math.sin(yaw0)
+        for n_i, (px, py) in enumerate(NEW_MACHINE_PORTS):
+            mx, my = px - (c * ox - s_ * oy), py - (s_ * ox + c * oy)
+            if fp0 is not None and SKIP_OVERLAPPING_MACHINES:
+                dx, dy = mx - t0[0], my - t0[1]
+                box = (fp0[0] + dx, fp0[1] + dy, fp0[2] + dx, fp0[3] + dy)
+                if any(_overlap(box, b) for b in boxes):
+                    print("[OHT Fleet] skipped machine at port (%.2f, %.2f): would overlap another machine" % (px, py))
+                    continue
+                boxes.append(box)
+            p = "%s/GM_%02d" % (GROUND_MACHINES_PATH, n_i + 3)
+            Sdf.CopySpec(gm_layer, GROUND_MACHINE_TEMPLATE, dst_layer, p)
+            gm = stage.GetPrimAtPath(p)
+            gm.GetAttribute("xformOp:translate").Set(Gf.Vec3d(mx, my, t0[2]))
+            machines.append(gm)
+
+    # every machine is attached to the closest loop (if its port is on that rail).
+    # On rail shared by several loops (top line, verticals) the first loop gets it.
+    stations_s, station_names, slots, station_loop = [], [], [], []
+    for m in machines:
+        port = _port_of(m)
+        best = None
+        for li, lp in enumerate(paths):
+            s, off = lp.project(port[:2])
+            if best is None or off < best[1] - 1e-3:
+                best = (li, off, s)
+        if best is None or best[1] > STATION_SNAP_M:
+            print("[OHT Fleet] %s is %.2f m away from every OHT loop — not used as a stop"
+                  % (m.GetName(), best[1] if best else -1))
+            continue
+        li, _, s = best
+        stations_s.append(s)
+        station_names.append(m.GetName())
+        station_loop.append(li)
+        x, y, pyaw = paths[li].pose(s)
+        x += math.cos(pyaw) * claw_off[0] - math.sin(pyaw) * claw_off[1]
+        y += math.sin(pyaw) * claw_off[0] + math.cos(pyaw) * claw_off[1]
+        slots.append((x, y, port[2], _yaw_of(m)))
+    for li, lp in enumerate(paths):
+        nm = [station_names[k] for k in range(len(station_names)) if station_loop[k] == li]
+        print("[OHT Fleet] %s: %d machines used as stops: %s" % (lp.name, len(nm), ", ".join(nm) or "none"))
+
+    # ---- magazines
+    mag_root = stage.GetPrimAtPath(MAGAZINES_PATH)
+    mag_tmpl = stage.GetPrimAtPath(MAGAZINE_TEMPLATE)
+    n_mag = NUM_MAGAZINES if NUM_MAGAZINES is not None else len(stations_s) // 2
+    n_mag = max(0, min(n_mag, len(stations_s) - 1))
+    machine_mag = [None] * len(stations_s)
+    mags = []
+    kept_slots = set()
+    existing = sorted(mag_root.GetChildren(), key=lambda p: p.GetName()) \
+        if (KEEP_SCENE_LAYOUT and mag_root.IsValid()) else []
+    existing.sort(key=lambda p: p.GetName() not in MAGAZINE_MACHINE_ASSIGNMENT)
+    if existing:
+        for mp in existing:
+            name = mp.GetName()
+            x, y, z, yaw = _world(mp)
+            forced_machine = MAGAZINE_MACHINE_ASSIGNMENT.get(name)
+            if forced_machine:
+                candidates = [i for i, machine_name in enumerate(station_names)
+                              if machine_name == forced_machine]
+                if not candidates:
+                    print("[OHT Fleet] ERROR: assigned machine %s for %s was not found" % (forced_machine, name))
+                    continue
+                k = candidates[0]
+                if machine_mag[k] is not None:
+                    print("[OHT Fleet] ERROR: %s already has a magazine; cannot place %s" % (forced_machine, name))
+                    continue
+                x, y, z, yaw = slots[k]
+                print("[OHT Fleet] positioning %s on %s (%s)" % (name, forced_machine, paths[station_loop[k]].name))
+            else:
+                free = [k for k in range(len(slots)) if machine_mag[k] is None]
+                if not free:
+                    print("[OHT Fleet] %s: no free machine left" % name)
+                    continue
+                k = min(free, key=lambda k: math.hypot(slots[k][0] - x, slots[k][1] - y))
+                dist = math.hypot(slots[k][0] - x, slots[k][1] - y)
+                if dist > MAG_MATCH_RADIUS_M:
+                    print("[OHT Fleet] %s is %.2f m from %s and was not registered" % (name, dist, station_names[k]))
+                    continue
+                if abs(z - slots[k][2]) > 0.3:
+                    z = slots[k][2]
+
+            if not mp.GetAttribute("xformOp:orient"):
+                mp.CreateAttribute("xformOp:orient", Sdf.ValueTypeNames.Quatd)
+            order = ["xformOp:translate", "xformOp:orient"]
+            if mp.GetAttribute("xformOp:scale"):
+                order.append("xformOp:scale")
+            mp.GetAttribute("xformOpOrder").Set(Vt.TokenArray(order))
+            mp.GetAttribute("xformOp:translate").Set(Gf.Vec3d(x, y, z))
+            h = yaw / 2.0
+            o_attr = mp.GetAttribute("xformOp:orient")
+            QuatT = o_attr.GetTypeName().type.pythonClass or Gf.Quatd
+            o_attr.Set(QuatT(math.cos(h), 0, 0, math.sin(h)))
+
+            UsdGeom.Imageable(mp).MakeVisible()
+            if MAGAZINE_INSTANCEABLE:
+                mp.SetInstanceable(True)
+
+            mags.append({
+                "t": _W(mp.GetAttribute("xformOp:translate")),
+                "o": _W(mp.GetAttribute("xformOp:orient")),
+                "pose": (x, y, z, yaw),
+                "attach": None,
+                "prim": mp,
+            })
+            machine_mag[k] = len(mags) - 1
+            slots[k] = (x, y, z, yaw)
+            kept_slots.add(k)
+
+            # align the stop point with the gripper, on THIS machine's loop
+            lp = paths[station_loop[k]]
+            rb = _bbox(mp)
+            cx, cy = (rb.GetMidpoint()[0], rb.GetMidpoint()[1]) if rb is not None else (x, y)
+            s0, _ = lp.project((cx, cy))
+            pyaw = lp.pose(s0)[2]
+            ox_ = math.cos(pyaw) * claw_off[0] - math.sin(pyaw) * claw_off[1]
+            oy_ = math.sin(pyaw) * claw_off[0] + math.cos(pyaw) * claw_off[1]
+            s_k = lp.project((cx - ox_, cy - oy_))[0]
+            px_, py_, _ = lp.pose(s_k)
+            dx_ = px_ + ox_ - cx
+            dy_ = py_ + oy_ - cy
+            if math.hypot(dx_, dy_) < 0.5:
+                x += dx_
+                y += dy_
+            mags[-1]["pose"] = (x, y, z, yaw)
+            slots[k] = (x, y, z, yaw)
+            stations_s[k] = s_k
+
+        if HIDE_ORIGINAL_MAGAZINE and mag_tmpl.IsValid():
+            UsdGeom.Imageable(mag_tmpl).MakeInvisible()
+        print("[OHT Fleet] %d magazines placed on: %s"
+              % (len(mags), ", ".join(station_names[k] for k in range(len(stations_s)) if machine_mag[k] is not None)))
+    elif n_mag > 0:
+        print("[OHT Fleet] no magazines found in %s — OHTs will only move the hoist" % MAGAZINES_PATH)
+
+    def _set_mag_pose(m, x, y, z, yaw):
+        m["t"].set(Gf.Vec3d(x, y, z))
+        h = yaw / 2
+        QuatT = m["o"].cls or Gf.Quatd
+        m["o"].set(QuatT(math.cos(h), 0, 0, math.sin(h)))
+
+    for m in mags:
+        _set_mag_pose(m, *m["pose"])
+
+    if mags and CENTER_UNDER_CLAWS and not kept_slots:
+        r_m = _bbox(mags[0]["prim"])
+        if r_m is not None:
+            mx0, my0, _, myaw0 = mags[0]["pose"]
+            cx, cy = (r_m.GetMin()[0] + r_m.GetMax()[0]) / 2, (r_m.GetMin()[1] + r_m.GetMax()[1]) / 2
+            dx, dy = cx - mx0, cy - my0
+            loc = (math.cos(-myaw0) * dx - math.sin(-myaw0) * dy, math.sin(-myaw0) * dx + math.cos(-myaw0) * dy)
+
+            def _shift(pose):
+                x, y, z, yaw = pose
+                return (x - (math.cos(yaw) * loc[0] - math.sin(yaw) * loc[1]),
+                        y - (math.sin(yaw) * loc[0] + math.cos(yaw) * loc[1]), z, yaw)
+            slots = [sl if k in kept_slots else _shift(sl) for k, sl in enumerate(slots)]
+            for m in mags:
+                m["pose"] = _shift(m["pose"])
+                _set_mag_pose(m, *m["pose"])
+
+    claw_rel_z = mag_top_rel = mag_mid_rel = None
+    if r_h is not None:
+        claw_rel_z = r_h.GetMin()[2] - prims[0][0].Get()[2]
+    if mags:
+        r_m1 = _bbox(mags[0]["prim"])
+        if r_m1 is not None:
+            mag_top_rel = r_m1.GetMax()[2] - mags[0]["pose"][2]
+            mag_mid_rel = r_m1.GetMidpoint()[2] - mags[0]["pose"][2]
+
+    def _vdrop(v):
+        return v.drop if v.drop is not None else drop_m
+
+    def _lift(v):
+        carrying = v.mag is not None and v.mag < len(mags) and mags[v.mag]["attach"] is not None
+        return -_vdrop(v) * v.hoist + (carry_raise if carrying else 0.0) * (1.0 - v.hoist)
+
+    def _gripper(v):
+        x, y, yaw = v.path.pose(v.s)
+        return x, y, oht_z + _lift(v), yaw
+
+    # callbacks get the sim's LOCAL station index -> map to the global machine index
+    def on_arrive(sim_, v, kl, action):
+        k = sim_.gk[kl]
+        v.drop = drop_m
+        if action == "drop" and v.mag is not None and v.mag < len(mags):
+            v.drop = max(0.05, mags[v.mag]["pose"][2] - slots[k][2] - carry_raise)
+        elif action == "pick" and sim_.machine_mag[kl] is not None:
+            mz = mags[sim_.machine_mag[kl]]["pose"][2]
+            d = None
+            if held_rel_z is not None and mag_mid_rel is not None:
+                d = (oht_z + held_rel_z) - (mz + mag_mid_rel)
+            elif claw_rel_z is not None and mag_top_rel is not None:
+                d = (oht_z + claw_rel_z) - (mz + mag_top_rel - GRIP_DEPTH_M)
+            if d is not None and 0.1 < d < 10:
+                v.drop = d
+        if LOG_JOBS and action:
+            print("[OHT Fleet] %s OHT_%02d lowering %.2f m to %s" % (v.loop, v.idx + 1, v.drop, action))
+
+    def on_event(sim_, v, kl, kind, mag_id):
+        k = sim_.gk[kl]
+        if mag_id is None or mag_id >= len(mags):
+            return
+        m = mags[mag_id]
+        gx, gy, gz, gyaw = _gripper(v)
+        if kind == "pick":
+            mx, my, mz, myaw = m["pose"]
+            dx, dy = mx - gx, my - gy
+            c, s_ = math.cos(-gyaw), math.sin(-gyaw)
+            m["attach"] = (c * dx - s_ * dy, s_ * dx + c * dy, mz - gz, myaw - gyaw)
+        else:
+            m["attach"] = None
+        if LOG_JOBS:
+            print("[OHT Fleet] %s OHT_%02d %s %s at %s"
+                  % (v.loop, v.idx + 1, "picked up" if kind == "pick" else "dropped off",
+                     m["prim"].GetName(), station_names[k]))
+
+    # ---- one traffic simulation per loop, coupled where the loops share rail
+    sims, offset = [], 0
+    for li, (r, lp, n_r) in enumerate(loops):
+        locs = [k for k in range(len(stations_s)) if station_loop[k] == li]
+        s_ = FleetSim(lp, n_r, veh_len, [stations_s[k] for k in locs],
+                      [machine_mag[k] for k in locs], idx_offset=offset, name=lp.name)
+        s_.gk = locs
+        s_.on_arrive = (lambda sm: (lambda v, kl, a: on_arrive(sm, v, kl, a)))(s_)
+        s_.on_event = (lambda sm: (lambda v, kl, kind, mid: on_event(sm, v, kl, kind, mid)))(s_)
+        offset += n_r
+        sims.append(s_)
+        n_full = sum(1 for k in locs if machine_mag[k] is not None)
+        if locs and n_full == len(locs):
+            print("[OHT Fleet] WARNING %s: every machine has a magazine — nowhere to drop, OHTs will "
+                  "pick one up and then circulate" % lp.name)
+        elif locs and n_full == 0:
+            print("[OHT Fleet] %s: no magazines on this loop — its OHTs just circulate" % lp.name)
+    traffic = SharedTraffic(sims)
+    for a, b, (hx, hy), hl in traffic.head_on:
+        print("[OHT Fleet] WARNING: %s and %s use the same rail in OPPOSITE directions (%.1f m, e.g. at "
+              "%.2f, %.2f) — they will meet head-on. Give all loops the same \"reverse\"." % (a, b, hl, hx, hy))
+    for line in traffic.summary():
+        print("[OHT Fleet] " + line)
+    traffic.place_initial()
+    all_veh = [v for s_ in sims for v in s_.veh]        # in OHT_01..N order
+    timeline = omni.timeline.get_timeline_interface()
+
+    # ---- hoist cables
+    cable_pts_local = None
+    anchors = tmpl.GetCustomDataByKey("ohtCableAnchors")
+    if anchors:
+        cable_pts_local = [(a[0], a[1], a[2]) for a in anchors]
+    ct = stage.GetPrimAtPath(CABLE_TEMPLATE)
+    t_pos = tmpl.GetAttribute("xformOp:translate:oht").Get()
+    t_ori = tmpl.GetAttribute("xformOp:orient:oht").Get()
+    if cable_pts_local is None and ct.IsValid() and ct.GetAttribute("points").Get() \
+            and t_pos is not None and t_ori is not None:
+        pts = ct.GetAttribute("points").Get()
+        th = -_qyaw(t_ori)
+        c_, s2 = math.cos(th), math.sin(th)
+        cable_pts_local = []
+        for i in range(0, len(pts) - 1, 2):
+            top = max(pts[i], pts[i + 1], key=lambda p: p[2])
+            dx, dy = top[0] - t_pos[0], top[1] - t_pos[1]
+            cable_pts_local.append((c_ * dx - s2 * dy, s2 * dx + c_ * dy, top[2] - t_pos[2]))
+    if cable_pts_local is None:
+        cable_pts_local = [(sx * 0.1, sy * 0.05, -0.096) for sx in (-1, 1) for sy in (-1, 1)]
+    if held_ref[1] is not None:
+        cb = held_ref[1]
+        o0 = prims[0][0].Get()
+        th = -_qyaw(prims[0][1].Get())
+        c_, s2 = math.cos(th), math.sin(th)
+        mx_, my_ = cb.GetMidpoint()[0], cb.GetMidpoint()[1]
+        hx, hy = cb.GetSize()[0] * 0.3, cb.GetSize()[1] * 0.3
+        cable_pts_local = []
+        for sx_ in (-1, 1):
+            for sy_ in (-1, 1):
+                dx, dy = mx_ + sx_ * hx - o0[0], my_ + sy_ * hy - o0[1]
+                cable_pts_local.append((c_ * dx - s2 * dy, s2 * dx + c_ * dy, cb.GetMax()[2] - o0[2]))
+    cable_ops = []
+
+    def _make_drawn_cables():
+        UsdGeom.Scope.Define(stage, FLEET_PATH + "/Hoist_Cables")
+        for i in range(total_oht):
+            grp = UsdGeom.Xform.Define(stage, "%s/Hoist_Cables/OHT_%02d" % (FLEET_PATH, i + 1))
+            ops = []
+            for j in range(len(cable_pts_local)):
+                cyl = UsdGeom.Cylinder.Define(stage, "%s/Hoist_Cables/OHT_%02d/c%d" % (FLEET_PATH, i + 1, j))
+                cyl.CreateRadiusAttr(CABLE_WIDTH_M / 2)
+                cyl.CreateHeightAttr(1.0)
+                cyl.CreateAxisAttr(UsdGeom.Tokens.z)
+                cyl.CreateDisplayColorAttr([Gf.Vec3f(*CABLE_COLOR)])
+                ops.append((_W(cyl.AddTranslateOp().GetAttr()), _W(cyl.AddScaleOp().GetAttr())))
+            cable_ops.append((_W(grp.CreateVisibilityAttr()), ops))
+
+    if SHOW_CABLES is True:
+        _make_drawn_cables()
+
+    def _update_cables():
+        for v, (vis, ops) in zip(all_veh, cable_ops):
+            length = -_lift(v) + 0.002
+            if length < 0.005:
+                vis.set(UsdGeom.Tokens.invisible)
+                continue
+            vis.set(UsdGeom.Tokens.inherited)
+            x, y, yaw = v.path.pose(v.s)
+            th = yaw + yaw_off + base_yaw
+            c_, s2 = math.cos(th), math.sin(th)
+            for (dx, dy, dz), (t_op, s_op) in zip(cable_pts_local, ops):
+                top = oht_z + dz
+                t_op.set(Gf.Vec3d(x + c_ * dx - s2 * dy, y + s2 * dx + c_ * dy, top - length / 2))
+                s_op.set(Gf.Vec3f(1, 1, length))
+
+    model_cables = []
+    if MODEL_CABLES:
+        found_names = set()
+        for i_oht, (_, _, _, prim, _) in enumerate(prims):
+            mine, skip = [], None
+            mc, others = clip_info[i_oht] if i_oht < len(clip_info) else (None, [])
+            groups = []
+            for p in Usd.PrimRange(prim):
+                if skip and p.GetPath().HasPrefix(skip):
+                    continue
+                if any(h in p.GetName().lower() for h in CABLE_NAME_HINTS) and UsdGeom.Xformable(p):
+                    skip = p.GetPath()
+                    kids = [k for k in p.GetChildren() if _bbox(k) is not None]
+                    groups += kids if len(kids) >= 2 else [p]
+            for p in groups:
+                r = _bbox(p)
+                if r is None or r.GetSize()[2] < 1e-6:
+                    continue
+                if mc is not None and others:
+                    bc = r.GetMidpoint()
+                    d_me = math.hypot(bc[0] - mc[0], bc[1] - mc[1])
+                    if any(math.hypot(bc[0] - o[0], bc[1] - o[1]) < d_me for o in others):
+                        continue
+                on_hoist = "/Hoist_Unit/" in str(p.GetPath()) or \
+                    any(p.GetPath().HasPrefix(b) for b in builtin_paths)
+                c = r.GetMidpoint()
+                pivot_w = Gf.Vec3d(c[0], c[1], r.GetMin()[2] if on_hoist else r.GetMax()[2])
+                inv = UsdGeom.Xformable(p).ComputeLocalToWorldTransform(Usd.TimeCode.Default()).GetInverse()
+                pivot = inv.Transform(pivot_w)
+                d = inv.TransformDir(Gf.Vec3d(0, 0, 1))
+                axis = max(range(3), key=lambda i: abs(d[i]))
+                xf = UsdGeom.Xformable(p)
+                xf.AddTranslateOp(UsdGeom.XformOp.PrecisionDouble, "cablePivot").Set(pivot)
+                s_op = xf.AddScaleOp(UsdGeom.XformOp.PrecisionDouble, "cableStretch")
+                s_op.Set(Gf.Vec3d(1, 1, 1))
+                xf.AddTranslateOp(UsdGeom.XformOp.PrecisionDouble, "cablePivotInv").Set(-pivot)
+                mine.append((_W(s_op.GetAttr()), axis, r.GetSize()[2]))
+                found_names.add(p.GetName())
+            model_cables.append(mine)
+        n_found = sum(len(m) for m in model_cables)
+        if n_found:
+            print("[OHT Fleet] using %d cables from your OHT model (%s)"
+                  % (n_found // max(1, len(prims)), ", ".join(sorted(found_names))))
+        else:
+            print("[OHT Fleet] no belts found for the moving clip in the OHT model")
+    if SHOW_CABLES == "auto" and not cable_ops and not any(model_cables):
+        _make_drawn_cables()
+        print("[OHT Fleet] drawing 4 cables on top of the gripper")
+
+    def _update_model_cables():
+        for v, mine in zip(all_veh, model_cables):
+            lift = _lift(v)
+            for s_w, axis, rest_len in mine:
+                k = max(1e-3, rest_len - lift) / rest_len
+                s = [1.0, 1.0, 1.0]
+                s[axis] = k
+                s_w.set(Gf.Vec3d(*s))
+
+    writers = [(_W(t_a), _W(o_a), _W(h_a) if h_a else None, claws) for t_a, o_a, h_a, _, claws in prims]
+
+    def write_poses():
+        with Sdf.ChangeBlock():
+            for v, (t_a, o_a, h_a, claws) in zip(all_veh, writers):
+                x, y, yaw = v.path.pose(v.s)
+                t_a.set(Gf.Vec3d(x, y, oht_z))
+                half = (yaw + yaw_off) / 2
+                q = Gf.Quatd(math.cos(half), 0, 0, math.sin(half)) * base_q
+                o_a.set(q)
+                if h_a:
+                    h_a.set(Gf.Vec3d(0, 0, _lift(v) / hoist_scale))
+                if builtin:
+                    lift = _lift(v)
+                    for w, d in builtin[v.idx]:
+                        w.set(d * lift)
+                    for w, d, _ in builtin_claws[v.idx]:
+                        w.set(d * (-v.claw))
+                for c_attr, rest in claws:
+                    inward = -1.0 if rest[0] > 0 else 1.0
+                    c_attr.set(Gf.Vec3d(rest[0] + inward * v.claw, rest[1], rest[2]))
+                if v.mag is not None and v.mag < len(mags) and mags[v.mag]["attach"]:
+                    m = mags[v.mag]
+                    ax, ay, az, ayaw = m["attach"]
+                    gx, gy, gz, gyaw = _gripper(v)
+                    c, s_ = math.cos(gyaw), math.sin(gyaw)
+                    m["pose"] = (gx + c * ax - s_ * ay, gy + s_ * ax + c * ay, gz + az, gyaw + ayaw)
+                    _set_mag_pose(m, *m["pose"])
+            _update_cables()
+            _update_model_cables()
+
+    write_poses()
+
+    n_kin = 0
+    for _, _, _, prim, _ in prims:
+        for p in Usd.PrimRange(prim):
+            if p.HasAPI(UsdPhysics.RigidBodyAPI):
+                UsdPhysics.RigidBodyAPI(p).CreateKinematicEnabledAttr(True)
+                n_kin += 1
+    if KINEMATIC_COLLIDERS:
+        roots = [pr for _, _, _, pr, _ in prims] + [m["prim"] for m in mags]
+        for root in roots:
+            has_col = has_rb = False
+            for p in Usd.PrimRange(root, Usd.TraverseInstanceProxies()):
+                has_col = has_col or p.HasAPI(UsdPhysics.CollisionAPI)
+                has_rb = has_rb or p.HasAPI(UsdPhysics.RigidBodyAPI)
+            if has_col and not has_rb:
+                UsdPhysics.RigidBodyAPI.Apply(root).CreateKinematicEnabledAttr(True)
+                n_kin += 1
+    if n_kin:
+        print("[OHT Fleet] %d moving objects set to kinematic physics bodies" % n_kin)
+
+    import time
+    import traceback
+
+    class _Handle:
+        def __init__(self):
+            self.sims = sims
+            self.traffic = traffic
+            self.last = None
+            self.errors = 0
+            self.frames = 0
+            self.sub = None
+            self.observer = None
+            try:   # Kit 105/106 (Isaac Sim 4.x)
+                self.sub = omni.kit.app.get_app().get_update_event_stream().create_subscription_to_pop(
+                    self._on_update, name="oht_fleet_controller")
+            except Exception:   # newer Kit (Isaac Sim 5.x / 6.x)
+                import carb.eventdispatcher
+                self.observer = carb.eventdispatcher.get_eventdispatcher().observe_event(
+                    event_name=omni.kit.app.GLOBAL_EVENT_UPDATE,
+                    on_event=self._on_update, observer_name="oht_fleet_controller")
+
+        def _on_update(self, *_):
+            now = time.perf_counter()
+            dt = 0.0 if self.last is None else now - self.last
+            self.last = now
+            if RUN_ONLY_WHEN_PLAYING and not timeline.is_playing():
+                return
+            try:
+                t0 = time.perf_counter()
+                self.traffic.step(dt)           # all loops advance together, coupled
+                write_poses()
+                self.frames += 1
+                if PROFILE_EVERY_S:
+                    self._prof(dt, time.perf_counter() - t0)
+                if self.frames == 30:
+                    print("[OHT Fleet] running — " + ", ".join(
+                        "%s: OHT_%02d %.2f m/s %s" % (s_.name, s_.veh[0].idx + 1, s_.veh[0].v, s_.veh[0].state)
+                        for s_ in self.sims if s_.veh))
+            except Exception:
+                self.errors += 1
+                if self.errors <= 3:
+                    print("[OHT Fleet] ERROR in update:\n" + traceback.format_exc())
+
+        def _prof(self, dt, used):
+            p = getattr(self, "_p", None)
+            if p is None:
+                p = self._p = {"t": 0.0, "n": 0, "used": 0.0, "max": 0.0, "fmax": 0.0}
+            p["t"] += dt; p["n"] += 1; p["used"] += used
+            p["max"] = max(p["max"], used); p["fmax"] = max(p["fmax"], dt)
+            if p["t"] >= PROFILE_EVERY_S:
+                frame = p["t"] / p["n"] * 1000
+                script = p["used"] / p["n"] * 1000
+                share = 100 * script / frame if frame else 0
+                if share < 10:
+                    self._p = None
+
+        def stop(self):
+            if self.sub:
+                self.sub.unsubscribe()
+                self.sub = None
+            self.observer = None
+            print("[OHT Fleet] stopped")
+
+    builtins._oht_fleet = _Handle()
+    print("[OHT Fleet] %d loops, %d OHTs in total: %s. Vehicle length %.2f m, OHT z %.3f.%s"
+          % (len(sims), total_oht,
+             "; ".join("%s %.1f m with %d OHTs" % (s_.name, s_.path.length, len(s_.veh)) for s_ in sims),
+             veh_len, oht_z, " Press PLAY." if RUN_ONLY_WHEN_PLAYING else " Moving now."))
+
+
+try:
+    import omni.usd  # noqa: F401
+    _run_in_omniverse()
+except ImportError:
+    pass   # imported outside Omniverse (e.g. for offline testing)
