@@ -1147,7 +1147,7 @@ def _run_in_omniverse():
 
     # every machine is attached to the closest loop (if its port is on that rail).
     # On rail shared by several loops (top line, verticals) the first loop gets it.
-    stations_s, station_names, slots, station_loop = [], [], [], []
+    stations_s, station_names, slots, station_ports, station_loop = [], [], [], [], []
     for m in machines:
         port = _port_of(m)
         best = None
@@ -1163,10 +1163,8 @@ def _run_in_omniverse():
         stations_s.append(s)
         station_names.append(m.GetName())
         station_loop.append(li)
-        x, y, pyaw = paths[li].pose(s)
-        x += math.cos(pyaw) * claw_off[0] - math.sin(pyaw) * claw_off[1]
-        y += math.sin(pyaw) * claw_off[0] + math.cos(pyaw) * claw_off[1]
-        slots.append((x, y, port[2], _yaw_of(m)))
+        station_ports.append(port)
+        slots.append((port[0], port[1], port[2], _yaw_of(m)))
     for li, lp in enumerate(paths):
         nm = [station_names[k] for k in range(len(station_names)) if station_loop[k] == li]
         print("[OHT Fleet] %s: %d machines used as stops: %s" % (lp.name, len(nm), ", ".join(nm) or "none"))
@@ -1185,6 +1183,7 @@ def _run_in_omniverse():
     if existing:
         for mp in existing:
             name = mp.GetName()
+            UsdGeom.Imageable(mp).MakeVisible()
             x, y, z, yaw = _world(mp)
             forced_machine = MAGAZINE_MACHINE_ASSIGNMENT.get(name)
             if forced_machine:
@@ -1204,14 +1203,17 @@ def _run_in_omniverse():
                 if not free:
                     print("[OHT Fleet] %s: no free machine left" % name)
                     continue
-                k = min(free, key=lambda k: math.hypot(slots[k][0] - x, slots[k][1] - y))
-                dist = math.hypot(slots[k][0] - x, slots[k][1] - y)
+                rb = _bbox(mp)
+                cx, cy = (rb.GetMidpoint()[0], rb.GetMidpoint()[1]) if rb is not None else (x, y)
+                k = min(free, key=lambda k: math.hypot(slots[k][0] - cx, slots[k][1] - cy))
+                dist = math.hypot(slots[k][0] - cx, slots[k][1] - cy)
                 if dist > MAG_MATCH_RADIUS_M:
                     print("[OHT Fleet] %s is %.2f m from %s and was not registered" % (name, dist, station_names[k]))
                     continue
                 if abs(z - slots[k][2]) > 0.3:
                     z = slots[k][2]
 
+            x, y, yaw = slots[k][0], slots[k][1], slots[k][3]
             if not mp.GetAttribute("xformOp:orient"):
                 mp.CreateAttribute("xformOp:orient", Sdf.ValueTypeNames.Quatd)
             order = ["xformOp:translate", "xformOp:orient"]
@@ -1224,7 +1226,13 @@ def _run_in_omniverse():
             QuatT = o_attr.GetTypeName().type.pythonClass or Gf.Quatd
             o_attr.Set(QuatT(math.cos(h), 0, 0, math.sin(h)))
 
-            UsdGeom.Imageable(mp).MakeVisible()
+            rb = _bbox(mp)
+            if rb is not None:
+                center = rb.GetMidpoint()
+                x += station_ports[k][0] - center[0]
+                y += station_ports[k][1] - center[1]
+                mp.GetAttribute("xformOp:translate").Set(Gf.Vec3d(x, y, z))
+
             if MAGAZINE_INSTANCEABLE:
                 mp.SetInstanceable(True)
 
@@ -1248,14 +1256,6 @@ def _run_in_omniverse():
             ox_ = math.cos(pyaw) * claw_off[0] - math.sin(pyaw) * claw_off[1]
             oy_ = math.sin(pyaw) * claw_off[0] + math.cos(pyaw) * claw_off[1]
             s_k = lp.project((cx - ox_, cy - oy_))[0]
-            px_, py_, _ = lp.pose(s_k)
-            dx_ = px_ + ox_ - cx
-            dy_ = py_ + oy_ - cy
-            if math.hypot(dx_, dy_) < 0.5:
-                x += dx_
-                y += dy_
-            mags[-1]["pose"] = (x, y, z, yaw)
-            slots[k] = (x, y, z, yaw)
             stations_s[k] = s_k
 
         if HIDE_ORIGINAL_MAGAZINE and mag_tmpl.IsValid():
@@ -1586,8 +1586,8 @@ def _run_in_omniverse():
                     self._prof(dt, time.perf_counter() - t0)
                 if self.frames == 30:
                     print("[OHT Fleet] running — " + ", ".join(
-                        "%s: OHT_%02d %.2f m/s %s" % (s_.name, s_.veh[0].idx + 1, s_.veh[0].v, s_.veh[0].state)
-                        for s_ in self.sims if s_.veh))
+                        "OHT_%02d %s %.2f m/s %s" % (v.idx + 1, v.loop, v.v, v.state)
+                        for v in all_veh))
             except Exception:
                 self.errors += 1
                 if self.errors <= 3:
@@ -1625,3 +1625,4 @@ try:
     _run_in_omniverse()
 except ImportError:
     pass   # imported outside Omniverse (e.g. for offline testing)
+
